@@ -7,7 +7,7 @@ The ServerChest agent runs on your Odoo server and makes an outbound WebSocket c
 Run this on your Odoo server as root. Get your API key from the ServerChest dashboard when you add a server.
 
 ```bash
-curl -fsSL https://serverchest.com/install.sh | sudo bash -s -- --key=YOUR_API_KEY
+curl -fsSL https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/install.sh | sudo bash -s -- --key=YOUR_API_KEY
 ```
 
 The installer will:
