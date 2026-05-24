@@ -117,7 +117,7 @@ info "Creating agent directory at $AGENT_DIR..."
 mkdir -p "$AGENT_DIR"
 
 info "Downloading agent.py from serverchest.com..."
-curl -fsSL "https://serverchest.com/agent.py" -o "$AGENT_DIR/agent.py"
+curl -fsSL "https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/agent.py" -o "$AGENT_DIR/agent.py"
 chmod +x "$AGENT_DIR/agent.py"
 chown -R "$ODOO_USER:$ODOO_USER" "$AGENT_DIR"
 ok "Agent downloaded"
