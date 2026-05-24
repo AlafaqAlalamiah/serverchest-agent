@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+ServerChest Agent
+-----------------
+Runs on the Odoo server. Makes an outbound WebSocket connection to the
+ServerChest relay and executes commands sent by the dashboard.
+
+Config file: /etc/serverchest-agent.conf
+"""
+
+import asyncio
+import configparser
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+try:
+    import websockets
+except ImportError:
+    sys.exit("Missing dependency: pip install websockets")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG_FILE = os.environ.get('SERVERCHEST_CONFIG', '/etc/serverchest-agent.conf')
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE)
+    s = cfg['agent'] if 'agent' in cfg else {}
+    return {
+        'relay_url':     s.get('relay_url',     'ws://localhost:3003'),
+        'api_key':       s.get('api_key',        ''),
+        'backup_script': s.get('backup_script',  '/opt/odoo17/backup_to_onedrive.sh'),
+        'backup_log':    s.get('backup_log',     '/var/log/odoo/backup.log'),
+        'odoo_log':      s.get('odoo_log',       '/var/log/odoo/odoo17.log'),
+        'rclone_config': s.get('rclone_config',  '/opt/odoo17/rclone.conf'),
+        'odoo_conf':     s.get('odoo_conf',      '/etc/odoo17.conf'),
+        'odoo_bin':      s.get('odoo_bin',       '/opt/odoo17/odoo17-venv/bin/python'),
+        'odoo_src':      s.get('odoo_src',       '/opt/odoo17/odoo17/odoo-bin'),
+        'db_name':       s.get('db_name',        ''),
+        'service_name':  s.get('service_name',   'odoo17'),
+    }
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [agent] %(levelname)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+log = logging.getLogger('serverchest-agent')
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _human_size(n):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if n < 1024:
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} PB'
+
+def _run(cmd, timeout=30, input=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
+    return r.stdout, r.stderr, r.returncode
+
+# ── Action handlers ───────────────────────────────────────────────────────────
+
+def action_ping(params, cfg):
+    import platform
+    return {
+        'status': 'ok',
+        'hostname': platform.node(),
+        'agent_version': '2.0.0',
+        'db': cfg.get('db_name', ''),
+        'odoo_version': 'Odoo 17',
+    }
+
+def action_get_disk_usage(params, cfg):
+    result = {}
+    for label, path in [('root', '/'), ('odoo', '/opt/odoo17')]:
+        if os.path.exists(path):
+            u = shutil.disk_usage(path)
+            result[label] = {
+                'path': path,
+                'total_gb': round(u.total / 1024**3, 2),
+                'used_gb':  round(u.used  / 1024**3, 2),
+                'free_gb':  round(u.free  / 1024**3, 2),
+                'used_pct': round(u.used / u.total * 100, 1),
+            }
+    return result
+
+def action_get_logs(params, cfg):
+    log_path = cfg['odoo_log']
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(f'Log file not found: {log_path}')
+    n = max(1, min(int(params.get('n', 100)), 5000))
+    stdout, _, _ = _run(['tail', '-n', str(n), log_path])
+    return {'lines': stdout.splitlines(), 'path': log_path}
+
+def action_get_rclone_log(params, cfg):
+    log_path = cfg['backup_log']
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(f'Backup log not found: {log_path}')
+    n = max(1, min(int(params.get('n', 500)), 5000))
+    stdout, _, _ = _run(['tail', '-n', str(n), log_path])
+    return {'lines': stdout.splitlines(), 'path': log_path}
+
+def action_get_rclone_remotes(params, cfg):
+    rclone = shutil.which('rclone')
+    if not rclone:
+        raise RuntimeError('rclone not installed')
+    cmd = ['rclone', '--config', cfg['rclone_config'], 'listremotes'] if cfg['rclone_config'] else ['rclone', 'listremotes']
+    stdout, _, _ = _run(cmd)
+    remotes = [x.rstrip(':') for x in stdout.splitlines() if x]
+    return {'remotes': remotes}
+
+def action_trigger_backup(params, cfg):
+    script = cfg['backup_script']
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f'Backup script not found: {script}')
+    subprocess.Popen(
+        ['/bin/bash', script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {'status': 'triggered', 'script': script}
+
+def action_get_backup_config(params, cfg):
+    script = cfg['backup_script']
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f'Script not found: {script}')
+    with open(script) as f:
+        content = f.read()
+
+    def _get(var):
+        m = re.search(rf'^{var}=["\']?([^"\'\n]+)["\']?', content, re.MULTILINE)
+        return m.group(1).strip() if m else ''
+
+    config = {
+        'db_name':            _get('DB_NAME'),
+        'backup_dir':         _get('BACKUP_DIR'),
+        'onedrive_db':        _get('ONEDRIVE_DB'),
+        'onedrive_filestore': _get('ONEDRIVE_FILESTORE'),
+        'rclone_config':      _get('RCLONE_CONFIG'),
+        'script_path':        script,
+    }
+    daily_m   = re.search(r'daily.*?--min-age\s+(\d+)d',   content)
+    weekly_m  = re.search(r'weekly.*?--min-age\s+(\d+)d',  content)
+    monthly_m = re.search(r'monthly.*?--min-age\s+(\d+)d', content)
+    config['retain_daily_days']   = daily_m.group(1)   if daily_m   else '7'
+    config['retain_weekly_days']  = weekly_m.group(1)  if weekly_m  else '28'
+    config['retain_monthly_days'] = monthly_m.group(1) if monthly_m else '365'
+
+    stdout, _, _ = _run(['crontab', '-u', 'odoo17', '-l'])
+    cron_schedule = '0 2 * * *'
+    for line in stdout.splitlines():
+        if script in line and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) >= 5:
+                cron_schedule = ' '.join(parts[:5])
+            break
+    config['cron_schedule'] = cron_schedule
+    return config
+
+def action_set_backup_config(params, cfg):
+    script = cfg['backup_script']
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f'Script not found: {script}')
+    with open(script) as f:
+        content = f.read()
+
+    def _set(var, val):
+        nonlocal content
+        content = re.sub(
+            rf'^({var}=)["\']?[^"\'\n]*["\']?',
+            rf'\g<1>"{val}"',
+            content, flags=re.MULTILINE
+        )
+
+    if 'db_name'            in params: _set('DB_NAME',            params['db_name'])
+    if 'backup_dir'         in params: _set('BACKUP_DIR',         params['backup_dir'])
+    if 'onedrive_db'        in params: _set('ONEDRIVE_DB',        params['onedrive_db'])
+    if 'onedrive_filestore' in params: _set('ONEDRIVE_FILESTORE', params['onedrive_filestore'])
+    if 'rclone_config'      in params: _set('RCLONE_CONFIG',      params['rclone_config'])
+
+    def _set_retention(tier, days):
+        nonlocal content
+        content = re.sub(
+            rf'(# {tier}.*?--min-age\s+)\d+(d)',
+            rf'\g<1>{days}\g<2>',
+            content, flags=re.IGNORECASE | re.DOTALL
+        )
+
+    if 'retain_daily_days'   in params: _set_retention('daily',   params['retain_daily_days'])
+    if 'retain_weekly_days'  in params: _set_retention('weekly',  params['retain_weekly_days'])
+    if 'retain_monthly_days' in params: _set_retention('monthly', params['retain_monthly_days'])
+
+    with open(script, 'w') as f:
+        f.write(content)
+
+    # Update cron
+    if 'cron_schedule' in params:
+        stdout, _, _ = _run(['crontab', '-u', 'odoo17', '-l'])
+        lines = [l for l in stdout.splitlines() if script not in l]
+        lines.append(f"{params['cron_schedule']} {script}")
+        new_crontab = '\n'.join(lines) + '\n'
+        _run(['crontab', '-u', 'odoo17', '-'], input=new_crontab)
+
+    return {'status': 'saved'}
+
+def action_service_status(params, cfg):
+    svc = cfg['service_name']
+    stdout, _, rc = _run(['systemctl', 'is-active', svc])
+    is_active = stdout.strip() == 'active'
+    # Check HTTP
+    http_ok = False
+    try:
+        import urllib.request
+        urllib.request.urlopen('http://localhost:8069/web/health', timeout=5)
+        http_ok = True
+    except Exception:
+        pass
+    return {'service': svc, 'active': is_active, 'http_ok': http_ok, 'systemctl_status': stdout.strip()}
+
+def action_service_control(params, cfg):
+    svc = cfg['service_name']
+    action = params.get('action', '')
+    if action not in ('start', 'stop', 'restart'):
+        raise ValueError(f'Invalid action: {action}')
+    stdout, stderr, rc = _run(['sudo', 'systemctl', action, svc], timeout=60)
+    return {'action': action, 'service': svc, 'rc': rc, 'output': stdout + stderr}
+
+def action_get_odoo_info(params, cfg):
+    """Query installed modules and Odoo version directly from PostgreSQL."""
+    db = cfg['db_name']
+    if not db:
+        raise ValueError('db_name not configured in agent config')
+    query = """
+        SELECT name, state, latest_version, author
+        FROM ir_module_module
+        WHERE state IN ('installed','to upgrade','to remove')
+        ORDER BY name
+    """
+    stdout, stderr, rc = _run(
+        ['psql', '-d', db, '-t', '-A', '-F', '\t', '-c', query],
+        timeout=30
+    )
+    if rc != 0:
+        raise RuntimeError(f'psql error: {stderr.strip()}')
+    modules = []
+    for line in stdout.strip().splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 3:
+            modules.append({'name': parts[0], 'state': parts[1], 'version': parts[2], 'author': parts[3] if len(parts) > 3 else ''})
+    count = len(modules)
+    # Get DB size
+    db_size_bytes = 0
+    size_out, _, size_rc = _run(['psql', '-d', db, '-t', '-A', '-c', f"SELECT pg_database_size('{db}')"], timeout=10)
+    if size_rc == 0 and size_out.strip().isdigit():
+        db_size_bytes = int(size_out.strip())
+    def _human(n):
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if n < 1024: return f'{n:.1f} {unit}'
+            n /= 1024
+        return f'{n:.1f} PB'
+    return {'modules': modules, 'count': count, 'installed_modules': count,
+            'db': db, 'db_size_bytes': db_size_bytes, 'db_size': _human(db_size_bytes)}
+
+def action_read_odoo_conf(params, cfg):
+    conf_path = cfg['odoo_conf']
+    if not os.path.isfile(conf_path):
+        raise FileNotFoundError(f'Config not found: {conf_path}')
+    with open(conf_path) as f:
+        content = f.read()
+    # Parse key=value pairs from [options] section
+    parser = configparser.ConfigParser()
+    parser.read(conf_path)
+    options = dict(parser['options']) if 'options' in parser else {}
+    return {'options': options, 'raw': content, 'path': conf_path}
+
+
+def action_get_health(params, cfg):
+    disk = shutil.disk_usage('/')
+    rclone_installed = shutil.which('rclone') is not None
+    http_ok = False
+    try:
+        import urllib.request
+        urllib.request.urlopen('http://localhost:8069/web/health', timeout=5)
+        http_ok = True
+    except Exception:
+        pass
+    script = cfg.get('backup_script', '')
+    return {
+        'rclone_installed': rclone_installed,
+        'disk_total_gb': round(disk.total / 1024**3, 2),
+        'disk_free_gb':  round(disk.free  / 1024**3, 2),
+        'disk_used_gb':  round(disk.used  / 1024**3, 2),
+        'disk_free_pct': round(disk.free / disk.total * 100, 1),
+        'backup_script_configured': bool(script),
+        'backup_script_exists': os.path.isfile(script) if script else False,
+        'db_connection': http_ok,
+    }
+
+
+def action_dump_database(params, cfg):
+    """pg_dump in custom format, returned as base64."""
+    import base64
+    import subprocess as _sp
+    db = cfg['db_name']
+    if not db:
+        raise ValueError('db_name not configured')
+    r = _sp.run(['pg_dump', '-Fc', db], capture_output=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f'pg_dump failed: {r.stderr.decode(errors="replace").strip()}')
+    data_b64 = base64.b64encode(r.stdout).decode('ascii')
+    return {
+        'filename': f'{db}.dump',
+        'size_bytes': len(r.stdout),
+        'data_b64': data_b64,
+    }
+
+# ── Dispatch table ────────────────────────────────────────────────────────────
+ACTIONS = {
+    'ping':               action_ping,
+    'get_disk_usage':     action_get_disk_usage,
+    'get_logs':           action_get_logs,
+    'get_rclone_log':     action_get_rclone_log,
+    'get_rclone_remotes': action_get_rclone_remotes,
+    'trigger_backup':     action_trigger_backup,
+    'get_backup_config':  action_get_backup_config,
+    'set_backup_config':  action_set_backup_config,
+    'service_status':     action_service_status,
+    'service_control':    action_service_control,
+    'get_odoo_info':      action_get_odoo_info,
+    'read_odoo_conf':     action_read_odoo_conf,
+    'get_health':         action_get_health,
+    'dump_database':      action_dump_database,
+}
+
+def dispatch(action, params, cfg):
+    if action not in ACTIONS:
+        raise ValueError(f'Unknown action: {action}. Allowed: {sorted(ACTIONS)}')
+    return ACTIONS[action](params, cfg)
+
+# ── WebSocket client loop ─────────────────────────────────────────────────────
+
+MONITOR_INTERVAL = 300   # 5 minutes between checks
+MONITOR_COOLDOWN = 7200  # 2-hour local cooldown per alert type (server also enforces cooldown)
+DISK_MIN_PCT     = 70    # only send disk_warning if above this % (server checks its threshold)
+
+
+async def _receive_commands(ws, cfg):
+    """Handle incoming commands from the relay."""
+    async for raw in ws:
+        msg = json.loads(raw)
+        if msg.get('type') != 'command':
+            continue
+        cmd_id = msg.get('id')
+        action = msg.get('action', '')
+        params = msg.get('params', {})
+        log.info('Executing action: %s (id=%s)', action, cmd_id)
+        try:
+            data = dispatch(action, params, cfg)
+            response = {'type': 'response', 'id': cmd_id, 'data': data}
+        except Exception as e:
+            log.warning('Action %s failed: %s', action, e)
+            response = {'type': 'response', 'id': cmd_id, 'error': str(e)}
+        await ws.send(json.dumps(response))
+
+
+async def _monitor_loop(ws, cfg):
+    """Background task: detect failures and push alert messages through the WebSocket."""
+    cooldown = {}          # event_key -> monotonic timestamp of last alert sent
+    await asyncio.sleep(30)  # brief startup delay
+
+    while True:
+        try:
+            loop_time = asyncio.get_event_loop().time()
+
+            # ── Odoo service check ────────────────────────────────────────────
+            try:
+                status = action_service_status({}, cfg)
+                if not (status['active'] and status['http_ok']):
+                    event = 'odoo_down'
+                    if loop_time - cooldown.get(event, 0) >= MONITOR_COOLDOWN:
+                        await ws.send(json.dumps({
+                            'type': 'alert', 'event': event,
+                            'data': {
+                                'service_active': str(status['active']),
+                                'http_ok':        str(status['http_ok']),
+                                'status':         status.get('systemctl_status', 'unknown'),
+                            },
+                        }))
+                        cooldown[event] = loop_time
+                        log.info('[monitor] Alert sent: %s', event)
+            except Exception as exc:
+                log.warning('[monitor] Service check error: %s', exc)
+
+            # ── Disk usage check ──────────────────────────────────────────────
+            try:
+                disk = action_get_disk_usage({}, cfg)
+                worst = max(disk.values(), key=lambda x: x.get('used_pct', 0), default=None)
+                if worst and worst.get('used_pct', 0) >= DISK_MIN_PCT:
+                    event = 'disk_warning'
+                    if loop_time - cooldown.get(event, 0) >= MONITOR_COOLDOWN:
+                        info = worst
+                        await ws.send(json.dumps({
+                            'type': 'alert', 'event': event,
+                            'data': {
+                                'partition': next((k for k, v in disk.items() if v is info), '?'),
+                                'path':      info['path'],
+                                'used_pct':  info['used_pct'],
+                                'used_gb':   f"{info['used_gb']} GB",
+                                'free_gb':   f"{info['free_gb']} GB",
+                                'total_gb':  f"{info['total_gb']} GB",
+                            },
+                        }))
+                        cooldown[event] = loop_time
+                        log.info('[monitor] Alert sent: disk_warning (%s%% on %s)', info['used_pct'], info['path'])
+            except Exception as exc:
+                log.warning('[monitor] Disk check error: %s', exc)
+
+            # ── Last backup status check ──────────────────────────────────────
+            try:
+                log_path = cfg['backup_log']
+                if os.path.isfile(log_path):
+                    stdout, _, _ = _run(['tail', '-n', '300', log_path])
+                    last_result = last_line = None
+                    for line in reversed(stdout.splitlines()):
+                        if 'BACKUP COMPLETED' in line or 'SUCCESS' in line.upper():
+                            last_result, last_line = 'success', line[:40]
+                            break
+                        if 'FAILED' in line.upper() or 'ERROR' in line.upper():
+                            last_result, last_line = 'failed', line[:40]
+                            break
+                    if last_result == 'failed':
+                        event = 'backup_failed'
+                        if loop_time - cooldown.get(event, 0) >= MONITOR_COOLDOWN:
+                            await ws.send(json.dumps({
+                                'type': 'alert', 'event': event,
+                                'data': {'last_result': 'failed', 'log_excerpt': last_line or ''},
+                            }))
+                            cooldown[event] = loop_time
+                            log.info('[monitor] Alert sent: backup_failed')
+            except Exception as exc:
+                log.warning('[monitor] Backup check error: %s', exc)
+
+        except Exception as exc:
+            log.warning('[monitor] Unexpected error: %s', exc)
+
+        await asyncio.sleep(MONITOR_INTERVAL)
+
+async def agent_loop(cfg):
+    url = cfg['relay_url']
+    api_key = cfg['api_key']
+
+    if not api_key:
+        log.error('api_key not set in %s — cannot connect', CONFIG_FILE)
+        sys.exit(1)
+
+    backoff = 2
+    while True:
+        try:
+            log.info('Connecting to relay at %s', url)
+            async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
+                backoff = 2  # reset on successful connect
+
+                # Auth
+                await ws.send(json.dumps({'type': 'auth', 'api_key': api_key}))
+                auth_reply = json.loads(await ws.recv())
+                if not auth_reply.get('ok'):
+                    log.error('Auth failed: %s', auth_reply.get('reason', 'unknown'))
+                    await asyncio.sleep(60)
+                    continue
+
+                log.info('Authenticated as server %s (%s)',
+                         auth_reply.get('server_id'), auth_reply.get('server_name'))
+
+                # Run command handler and monitoring loop concurrently.
+                # If either task finishes (command loop closed, WS error), cancel the other
+                # and fall through to the reconnect logic.
+                recv_task    = asyncio.create_task(_receive_commands(ws, cfg))
+                monitor_task = asyncio.create_task(_monitor_loop(ws, cfg))
+                done, pending = await asyncio.wait(
+                    [recv_task, monitor_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                # Re-raise any exception from the completed task so it's logged properly
+                for task in done:
+                    if task.exception():
+                        raise task.exception()
+
+        except (websockets.exceptions.ConnectionClosed,
+                ConnectionRefusedError, OSError) as e:
+            log.warning('Connection lost: %s — retrying in %ds', e, backoff)
+        except Exception as e:
+            log.error('Unexpected error: %s — retrying in %ds', e, backoff)
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)  # exponential backoff, cap at 60s
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main():
+    cfg = load_config()
+    log.info('ServerChest agent starting (relay=%s)', cfg['relay_url'])
+    try:
+        asyncio.run(agent_loop(cfg))
+    except (KeyboardInterrupt, SystemExit):
+        log.info('Shutting down...')
+
+if __name__ == '__main__':
+    main()
