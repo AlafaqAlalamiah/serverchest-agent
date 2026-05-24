@@ -33,7 +33,7 @@ def load_config():
     return {
         'relay_url':     s.get('relay_url',     'ws://localhost:3003'),
         'api_key':       s.get('api_key',        ''),
-        'backup_script': s.get('backup_script',  '/opt/odoo17/backup_to_onedrive.sh'),
+        'backup_script': s.get('backup_script',  '/opt/odoo17/odoo_backup.sh'),
         'backup_log':    s.get('backup_log',     '/var/log/odoo/backup.log'),
         'odoo_log':      s.get('odoo_log',       '/var/log/odoo/odoo17.log'),
         'rclone_config': s.get('rclone_config',  '/opt/odoo17/rclone.conf'),
@@ -42,6 +42,7 @@ def load_config():
         'odoo_src':      s.get('odoo_src',       '/opt/odoo17/odoo17/odoo-bin'),
         'db_name':       s.get('db_name',        ''),
         'service_name':  s.get('service_name',   'odoo17'),
+        'backup_remote': s.get('backup_remote',   ''),
     }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -141,8 +142,8 @@ def action_get_backup_config(params, cfg):
     config = {
         'db_name':            _get('DB_NAME'),
         'backup_dir':         _get('BACKUP_DIR'),
-        'onedrive_db':        _get('ONEDRIVE_DB'),
-        'onedrive_filestore': _get('ONEDRIVE_FILESTORE'),
+        'db_remote':        _get('BACKUP_DB_REMOTE'),
+        'filestore_remote': _get('BACKUP_FILESTORE_REMOTE'),
         'rclone_config':      _get('RCLONE_CONFIG'),
         'script_path':        script,
     }
@@ -181,8 +182,8 @@ def action_set_backup_config(params, cfg):
 
     if 'db_name'            in params: _set('DB_NAME',            params['db_name'])
     if 'backup_dir'         in params: _set('BACKUP_DIR',         params['backup_dir'])
-    if 'onedrive_db'        in params: _set('ONEDRIVE_DB',        params['onedrive_db'])
-    if 'onedrive_filestore' in params: _set('ONEDRIVE_FILESTORE', params['onedrive_filestore'])
+    if 'db_remote'        in params: _set('BACKUP_DB_REMOTE',        params['db_remote'])
+    if 'filestore_remote' in params: _set('BACKUP_FILESTORE_REMOTE', params['filestore_remote'])
     if 'rclone_config'      in params: _set('RCLONE_CONFIG',      params['rclone_config'])
 
     def _set_retention(tier, days):
@@ -321,6 +322,198 @@ def action_dump_database(params, cfg):
         'data_b64': data_b64,
     }
 
+
+def action_list_backups(params, cfg):
+    # List available backup files from rclone remote, grouped by tier.
+    if not shutil.which('rclone'):
+        raise RuntimeError('rclone not installed')
+
+    backup_remote = cfg.get('backup_remote', '').rstrip('/')
+    if not backup_remote:
+        script = cfg.get('backup_script', '')
+        if os.path.isfile(script):
+            with open(script) as fh:
+                content = fh.read()
+            m = re.search(r'BACKUP_DB_REMOTE=["\']?([^"\'\n ]+)', content, re.MULTILINE)
+            if m:
+                backup_remote = m.group(1).strip().rstrip('/')
+    if not backup_remote:
+        raise ValueError('backup_remote not configured')
+
+    rclone_conf = cfg.get('rclone_config', '')
+    base_cmd = ['rclone', '--config', rclone_conf, 'lsjson'] if rclone_conf else ['rclone', 'lsjson']
+
+    backups = {}
+    for tier in ('daily', 'weekly', 'monthly'):
+        remote_path = f'{backup_remote}/{tier}/'
+        stdout, stderr, rc = _run(base_cmd + [remote_path], timeout=60)
+        tier_files = []
+        if rc == 0 and stdout.strip():
+            try:
+                for entry in json.loads(stdout):
+                    name = entry.get('Name', '')
+                    if entry.get('IsDir') or not name.endswith('.dump'):
+                        continue
+                    tier_files.append({
+                        'name': name,
+                        'path': f'{backup_remote}/{tier}/{name}',
+                        'size': entry.get('Size', 0),
+                        'size_human': _human_size(entry.get('Size', 0)),
+                        'modified': entry.get('ModTime', ''),
+                    })
+                tier_files.sort(key=lambda x: x['modified'], reverse=True)
+            except (json.JSONDecodeError, KeyError):
+                pass
+        backups[tier] = tier_files
+
+    return {'backups': backups, 'total': sum(len(v) for v in backups.values()), 'remote': backup_remote}
+
+
+def action_verify_backup(params, cfg):
+    """Verify a backup by date: checks DB dump exists in cloud and filestore sync is non-empty.
+    Reads remote paths from the backup script — no hardcoded remote names.
+    """
+    date_str = params.get('date', '').strip()
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        raise ValueError('date must be YYYY-MM-DD')
+
+    if not shutil.which('rclone'):
+        raise RuntimeError('rclone not installed')
+
+    script = cfg.get('backup_script', '')
+    script_content = ''
+    if os.path.isfile(script):
+        with open(script) as fh:
+            script_content = fh.read()
+
+    def _get_var(var):
+        m = re.search(rf'{var}=["\'\']?([^"\'\' \n]+)', script_content, re.MULTILINE)
+        return m.group(1).strip().rstrip('/') if m else ''
+
+    # Resolve DB remote (prefer agent config, fall back to script var)
+    db_remote = cfg.get('backup_remote', '').rstrip('/') or _get_var('BACKUP_DB_REMOTE')
+    if not db_remote:
+        raise ValueError('backup_remote / BACKUP_DB_REMOTE not configured')
+
+    # Resolve filestore remote from script var
+    fs_remote = _get_var('BACKUP_FILESTORE_REMOTE')
+
+    rclone_conf = cfg.get('rclone_config', '')
+    base_cmd = ['rclone', '--config', rclone_conf, 'lsjson'] if rclone_conf else ['rclone', 'lsjson']
+
+    # --- DB dump check ---
+    db_ok = False
+    db_path = None
+    db_size = 0
+    db_size_human = ''
+    for tier in ('daily', 'weekly', 'monthly'):
+        stdout, _, rc = _run(base_cmd + [f'{db_remote}/{tier}/'], timeout=30)
+        if rc != 0 or not stdout.strip():
+            continue
+        try:
+            for entry in json.loads(stdout):
+                name = entry.get('Name', '')
+                if date_str in name and name.endswith('.dump'):
+                    db_ok = entry.get('Size', 0) > 0
+                    db_size = entry.get('Size', 0)
+                    db_size_human = _human_size(db_size)
+                    db_path = f'{db_remote}/{tier}/{name}'
+                    break
+        except (json.JSONDecodeError, KeyError):
+            pass
+        if db_path:
+            break
+
+    # --- Filestore check ---
+    fs_ok = False
+    fs_files = 0
+    if fs_remote:
+        stdout, _, rc = _run(base_cmd + ['--max-depth', '1', fs_remote + '/'], timeout=30)
+        if rc == 0 and stdout.strip():
+            try:
+                entries = [e for e in json.loads(stdout) if not e.get('IsDir')]
+                fs_files = len(entries)
+                fs_ok = fs_files > 0
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    return {
+        'db':        {'ok': db_ok, 'path': db_path, 'size': db_size, 'size_human': db_size_human},
+        'filestore': {'ok': fs_ok, 'path': fs_remote or None, 'files': fs_files},
+    }
+
+def action_restore_backup(params, cfg):
+    # Download a specific backup from rclone and restore it to the database.
+    import tempfile as _tempfile
+    rclone_path = params.get('path', '').strip()
+    if not rclone_path:
+        raise ValueError('path is required')
+    if not rclone_path.endswith('.dump'):
+        raise ValueError('Invalid backup path: must be a .dump file')
+
+    backup_remote = cfg.get('backup_remote', '')
+    if backup_remote:
+        remote_name = backup_remote.split(':')[0]
+        if not rclone_path.startswith(remote_name + ':'):
+            raise ValueError(f'Invalid backup path: expected remote {remote_name}:')
+
+    db = cfg['db_name']
+    if not db:
+        raise ValueError('db_name not configured')
+    svc = cfg['service_name']
+    rclone_conf = cfg.get('rclone_config', '')
+    base_rclone = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
+
+    tmp_dir = _tempfile.mkdtemp(prefix='sc_restore_')
+    dump_file = os.path.join(tmp_dir, 'restore.dump')
+    try:
+        log.info('[restore] Downloading %s', rclone_path)
+        dl_stdout, dl_stderr, dl_rc = _run(
+            base_rclone + ['copyto', rclone_path, dump_file], timeout=300)
+        if dl_rc != 0:
+            raise RuntimeError(f'Download failed: {dl_stderr.strip()}')
+        if not os.path.isfile(dump_file) or os.path.getsize(dump_file) == 0:
+            raise RuntimeError('Downloaded file is empty')
+        dump_size = os.path.getsize(dump_file)
+        log.info('[restore] Downloaded %s (%s)', os.path.basename(rclone_path), _human_size(dump_size))
+
+        log.info('[restore] Stopping %s', svc)
+        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+
+        _run(['psql', '-d', 'postgres', '-c',
+              f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+              f"WHERE datname='{db}' AND pid <> pg_backend_pid();"], timeout=15)
+
+        log.info('[restore] Recreating database %s', db)
+        _run(['psql', '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{db}"'], timeout=30)
+        _run(['psql', '-d', 'postgres', '-c', f'CREATE DATABASE "{db}"'], timeout=30)
+
+        log.info('[restore] Running pg_restore')
+        pg_stdout, pg_stderr, pg_rc = _run(
+            ['pg_restore', '-Fc', '-d', db, dump_file], timeout=600)
+        if pg_rc > 1:
+            raise RuntimeError(f'pg_restore failed (rc={pg_rc}): {pg_stderr.strip()[:500]}')
+
+        log.info('[restore] Starting %s', svc)
+        _run(['sudo', 'systemctl', 'start', svc], timeout=60)
+
+        log.info('[restore] Complete')
+        return {
+            'status': 'ok',
+            'restored_from': rclone_path,
+            'db': db,
+            'dump_size': dump_size,
+            'dump_size_human': _human_size(dump_size),
+        }
+    except Exception:
+        try:
+            _run(['sudo', 'systemctl', 'start', svc], timeout=60)
+        except Exception:
+            pass
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -337,6 +530,9 @@ ACTIONS = {
     'read_odoo_conf':     action_read_odoo_conf,
     'get_health':         action_get_health,
     'dump_database':      action_dump_database,
+    'list_backups':     action_list_backups,
+    'verify_backup':    action_verify_backup,
+    'restore_backup':   action_restore_backup,
 }
 
 def dispatch(action, params, cfg):
