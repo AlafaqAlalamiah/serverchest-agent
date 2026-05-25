@@ -402,6 +402,8 @@ def action_verify_backup(params, cfg):
     base_cmd = ['rclone', '--config', rclone_conf, 'lsjson'] if rclone_conf else ['rclone', 'lsjson']
 
     # --- DB dump check ---
+    # Filenames use compact date format: db_daily_20260524_0200.dump
+    date_compact = date_str.replace('-', '')
     db_ok = False
     db_path = None
     db_size = 0
@@ -413,7 +415,7 @@ def action_verify_backup(params, cfg):
         try:
             for entry in json.loads(stdout):
                 name = entry.get('Name', '')
-                if date_str in name and name.endswith('.dump'):
+                if date_compact in name and name.endswith('.dump'):
                     db_ok = entry.get('Size', 0) > 0
                     db_size = entry.get('Size', 0)
                     db_size_human = _human_size(db_size)
@@ -431,7 +433,7 @@ def action_verify_backup(params, cfg):
         stdout, _, rc = _run(base_cmd + ['--max-depth', '1', fs_remote + '/'], timeout=30)
         if rc == 0 and stdout.strip():
             try:
-                entries = [e for e in json.loads(stdout) if not e.get('IsDir')]
+                entries = json.loads(stdout)
                 fs_files = len(entries)
                 fs_ok = fs_files > 0
             except (json.JSONDecodeError, KeyError):
