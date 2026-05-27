@@ -516,6 +516,79 @@ def action_restore_backup(params, cfg):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+def action_create_rclone_remote(params, cfg):
+    """Create a new rclone remote. params: name, type, token (OAuth JSON str), fields (dict)."""
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    name  = params.get('name', '').strip()
+    rtype = params.get('type', '').strip()
+    if not name or not rtype:
+        raise ValueError('name and type are required')
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    stdout, _, _ = _run([rclone] + config_flag + ['listremotes'])
+    existing = [x.rstrip(':') for x in stdout.splitlines() if x]
+    if name in existing:
+        # Already configured — treat as success (idempotent)
+        return {'ok': True, 'remote': name, 'remotes': existing}
+    cmd = [rclone] + config_flag + ['config', 'create', name, rtype, '--non-interactive']
+    token = params.get('token', '').strip()
+    if token:
+        cmd += ['token', token]
+    fields = params.get('fields') or {}
+    for k, v in fields.items():
+        if k and v:
+            cmd += [str(k), str(v)]
+    stdout, stderr, rc = _run(cmd, timeout=15)
+    if rc != 0:
+        raise RuntimeError(f'rclone config create failed: {stderr.strip() or stdout.strip()}')
+    stdout2, _, _ = _run([rclone] + config_flag + ['listremotes'])
+    remotes = [x.rstrip(':') for x in stdout2.splitlines() if x]
+    return {'ok': True, 'remote': name, 'remotes': remotes}
+
+
+def action_delete_rclone_remote(params, cfg):
+    """Delete a rclone remote from rclone.conf."""
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    name = params.get('name', '').strip()
+    if not name:
+        raise ValueError('name is required')
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    _, stderr, rc = _run([rclone] + config_flag + ['config', 'delete', name], timeout=10)
+    if rc != 0:
+        raise RuntimeError(f'rclone config delete failed: {stderr.strip()}')
+    stdout, _, _ = _run([rclone] + config_flag + ['listremotes'])
+    remotes = [x.rstrip(':') for x in stdout.splitlines() if x]
+    return {'ok': True, 'remotes': remotes}
+
+
+
+def action_test_rclone_remote(params, cfg):
+    """Test rclone remote connectivity by listing a path. params: path (e.g. onedrive:Odoo-Backups/database)"""
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    path = params.get('path', '').strip()
+    if not path:
+        raise ValueError('path is required')
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    stdout, stderr, rc = _run([rclone] + config_flag + ['lsd', path, '--max-depth', '1'], timeout=20)
+    if rc != 0:
+        raise RuntimeError(stderr.strip() or stdout.strip() or 'Connection failed')
+    entries = len([l for l in stdout.splitlines() if l.strip()])
+    return {'ok': True, 'path': path, 'entries': entries}
+
+
+def action_sync_destinations(params, cfg):
+    """Write backup_destinations.json from the destinations array. params: destinations list"""
+    import json as _json
+    destinations = params.get('destinations', [])
+    dest_file = '/opt/odoo17/backup_destinations.json'
+    with open(dest_file, 'w') as f:
+        _json.dump(destinations, f, indent=2)
+    return {'ok': True, 'count': len(destinations), 'file': dest_file}
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -534,7 +607,11 @@ ACTIONS = {
     'dump_database':      action_dump_database,
     'list_backups':     action_list_backups,
     'verify_backup':    action_verify_backup,
-    'restore_backup':   action_restore_backup,
+    'restore_backup':        action_restore_backup,
+    'test_rclone_remote':    action_test_rclone_remote,
+    'sync_destinations':     action_sync_destinations,
+    'create_rclone_remote':  action_create_rclone_remote,
+    'delete_rclone_remote':  action_delete_rclone_remote,
 }
 
 def dispatch(action, params, cfg):
