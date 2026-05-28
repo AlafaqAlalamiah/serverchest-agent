@@ -154,6 +154,9 @@ def action_get_backup_config(params, cfg):
     config['retain_weekly_days']  = weekly_m.group(1)  if weekly_m  else '28'
     config['retain_monthly_days'] = monthly_m.group(1) if monthly_m else '365'
 
+    cleanup_m = re.search(r'^CLEANUP_LOCAL=["\']?(true|false)["\']?', content, re.MULTILINE | re.IGNORECASE)
+    config['cleanup_local'] = (cleanup_m.group(1).lower() == 'true') if cleanup_m else True
+
     stdout, _, _ = _run(['crontab', '-u', 'odoo17', '-l'])
     cron_schedule = '0 2 * * *'
     for line in stdout.splitlines():
@@ -197,6 +200,18 @@ def action_set_backup_config(params, cfg):
     if 'retain_daily_days'   in params: _set_retention('daily',   params['retain_daily_days'])
     if 'retain_weekly_days'  in params: _set_retention('weekly',  params['retain_weekly_days'])
     if 'retain_monthly_days' in params: _set_retention('monthly', params['retain_monthly_days'])
+
+    if 'cleanup_local' in params:
+        val = 'true' if params['cleanup_local'] else 'false'
+        if re.search(r'^CLEANUP_LOCAL=', content, re.MULTILINE):
+            _set('CLEANUP_LOCAL', val)
+        else:
+            # Variable not yet in script — insert after RCLONE_CONFIG line
+            content = re.sub(
+                r'(RCLONE_CONFIG=.*?\n)',
+                rf'\g<1>CLEANUP_LOCAL="{val}"\n',
+                content, count=1
+            )
 
     with open(script, 'w') as f:
         f.write(content)

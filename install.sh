@@ -77,8 +77,8 @@ for s in odoo17 odoo16 odoo; do
 done
 
 # Paths
-BACKUP_SCRIPT="/opt/odoo17/backup_to_onedrive.sh"
-for p in /opt/odoo17/backup_to_onedrive.sh /opt/odoo/backup_to_onedrive.sh; do
+BACKUP_SCRIPT="/opt/odoo17/odoo_backup.sh"
+for p in /opt/odoo17/odoo_backup.sh /opt/odoo17/backup_to_onedrive.sh /opt/odoo/backup_to_onedrive.sh; do
   [[ -f "$p" ]] && BACKUP_SCRIPT="$p" && break
 done
 
@@ -121,6 +121,19 @@ curl -fsSL "https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/
 chmod +x "$AGENT_DIR/agent.py"
 chown -R "$ODOO_USER:$ODOO_USER" "$AGENT_DIR"
 ok "Agent downloaded"
+
+# Download backup script if not already present
+if [ ! -f "/opt/odoo17/odoo_backup.sh" ]; then
+    info "Downloading odoo_backup.sh..."
+    curl -fsSL "https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/odoo_backup.sh" -o /opt/odoo17/odoo_backup.sh
+    sed -i "s/YOUR_DB_NAME/$DB_NAME/" /opt/odoo17/odoo_backup.sh
+    chmod +x /opt/odoo17/odoo_backup.sh
+    chown "$ODOO_USER:$ODOO_USER" /opt/odoo17/odoo_backup.sh
+    BACKUP_SCRIPT="/opt/odoo17/odoo_backup.sh"
+    ok "Backup script installed at /opt/odoo17/odoo_backup.sh"
+else
+    ok "Backup script already exists at $BACKUP_SCRIPT — skipping"
+fi
 
 # ── Write config ──────────────────────────────────────────────────────────────
 info "Writing /etc/serverchest-agent.conf..."
