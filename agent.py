@@ -226,6 +226,53 @@ def action_set_backup_config(params, cfg):
 
     return {'status': 'saved'}
 
+BACKUP_SCRIPT_URL = 'https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/odoo_backup.sh'
+
+def action_update_backup_script(params, cfg):
+    """Download the latest odoo_backup.sh template from GitHub, transplant the
+    existing server-specific config values, and atomically replace the script."""
+    import urllib.request, shutil, tempfile
+    script = cfg['backup_script']
+
+    # Read current config values to preserve them
+    existing = {}
+    if os.path.isfile(script):
+        with open(script) as f:
+            old = f.read()
+        def _get(var):
+            m = re.search(rf'^{var}=["\']?([^"\'\n]+)["\']?', old, re.MULTILINE)
+            return m.group(1).strip() if m else None
+        for var in ('DB_NAME', 'BACKUP_DIR', 'BACKUP_DB_REMOTE', 'BACKUP_FILESTORE_REMOTE',
+                    'RCLONE_CONFIG', 'CLEANUP_LOCAL', 'DESTINATIONS_FILE'):
+            v = _get(var)
+            if v:
+                existing[var] = v
+
+    # Download latest template
+    try:
+        with urllib.request.urlopen(BACKUP_SCRIPT_URL, timeout=15) as resp:
+            new_content = resp.read().decode()
+    except Exception as e:
+        raise RuntimeError(f'Failed to download backup script: {e}')
+
+    # Transplant preserved values into the new template
+    for var, val in existing.items():
+        new_content = re.sub(
+            rf'^({var}=)["\']?[^"\'\n]*["\']?',
+            rf'\g<1>"{val}"',
+            new_content, flags=re.MULTILINE
+        )
+
+    # Write atomically via temp file
+    script_dir = os.path.dirname(script)
+    with tempfile.NamedTemporaryFile('w', dir=script_dir, delete=False, suffix='.tmp') as tmp:
+        tmp.write(new_content)
+        tmp_path = tmp.name
+    os.chmod(tmp_path, 0o755)
+    os.replace(tmp_path, script)
+
+    return {'status': 'updated', 'script': script, 'preserved': list(existing.keys())}
+
 def action_service_status(params, cfg):
     svc = cfg['service_name']
     stdout, _, rc = _run(['systemctl', 'is-active', svc])
@@ -641,8 +688,9 @@ ACTIONS = {
     'get_rclone_log':     action_get_rclone_log,
     'get_rclone_remotes': action_get_rclone_remotes,
     'trigger_backup':     action_trigger_backup,
-    'get_backup_config':  action_get_backup_config,
-    'set_backup_config':  action_set_backup_config,
+    'get_backup_config':    action_get_backup_config,
+    'set_backup_config':    action_set_backup_config,
+    'update_backup_script': action_update_backup_script,
     'service_status':     action_service_status,
     'service_control':    action_service_control,
     'get_odoo_info':      action_get_odoo_info,
