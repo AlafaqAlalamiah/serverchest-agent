@@ -3,6 +3,7 @@ set -eE
 export TZ='Asia/Riyadh'   # force consistent timestamps regardless of caller
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+SCRIPT_VERSION="20260528"
 DB_NAME="YOUR_DB_NAME"
 BACKUP_DIR="/opt/odoo17/backup/tmp"
 FILESTORE="/opt/odoo17/.local/share/Odoo/filestore/$DB_NAME"

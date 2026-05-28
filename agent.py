@@ -157,6 +157,9 @@ def action_get_backup_config(params, cfg):
     cleanup_m = re.search(r'^CLEANUP_LOCAL=["\']?(true|false)["\']?', content, re.MULTILINE | re.IGNORECASE)
     config['cleanup_local'] = (cleanup_m.group(1).lower() == 'true') if cleanup_m else True
 
+    version_m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
+    config['script_version'] = version_m.group(1).strip() if version_m else None
+
     stdout, _, _ = _run(['crontab', '-u', 'odoo17', '-l'])
     cron_schedule = '0 2 * * *'
     for line in stdout.splitlines():
@@ -272,6 +275,31 @@ def action_update_backup_script(params, cfg):
     os.replace(tmp_path, script)
 
     return {'status': 'updated', 'script': script, 'preserved': list(existing.keys())}
+
+def action_check_backup_script_update(params, cfg):
+    """Compare the local script version with the latest on GitHub."""
+    import urllib.request
+    script = cfg['backup_script']
+    current_version = None
+    if os.path.isfile(script):
+        with open(script) as f:
+            content = f.read()
+        m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
+        current_version = m.group(1).strip() if m else None
+
+    try:
+        with urllib.request.urlopen(BACKUP_SCRIPT_URL, timeout=15) as resp:
+            remote = resp.read().decode()
+        m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', remote, re.MULTILINE)
+        latest_version = m.group(1).strip() if m else None
+    except Exception as e:
+        return {'error': f'Could not fetch remote script: {e}'}
+
+    return {
+        'current_version': current_version,
+        'latest_version':  latest_version,
+        'update_available': latest_version is not None and latest_version != current_version,
+    }
 
 def action_service_status(params, cfg):
     svc = cfg['service_name']
@@ -690,7 +718,8 @@ ACTIONS = {
     'trigger_backup':     action_trigger_backup,
     'get_backup_config':    action_get_backup_config,
     'set_backup_config':    action_set_backup_config,
-    'update_backup_script': action_update_backup_script,
+    'update_backup_script':       action_update_backup_script,
+    'check_backup_script_update': action_check_backup_script_update,
     'service_status':     action_service_status,
     'service_control':    action_service_control,
     'get_odoo_info':      action_get_odoo_info,
