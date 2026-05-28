@@ -579,6 +579,35 @@ def action_test_rclone_remote(params, cfg):
     return {'ok': True, 'path': path, 'entries': entries}
 
 
+def action_rclone_about(params, cfg):
+    """Get storage quota for an rclone remote. params: remote (e.g. 'onedrive:' or 'onedrive:path')"""
+    import json as _json
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    remote = params.get('remote', '').strip()
+    if not remote:
+        raise ValueError('remote is required')
+    # Normalize to just 'remotename:'
+    remote = remote.split(':')[0] + ':'
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    stdout, stderr, rc = _run([rclone] + config_flag + ['about', remote, '--json'], timeout=20)
+    if rc != 0:
+        raise RuntimeError(stderr.strip() or stdout.strip() or 'rclone about failed')
+    data = _json.loads(stdout)
+    def to_gb(b):
+        return round(b / 1073741824, 2) if b else None
+    total = data.get('total')
+    used  = data.get('used')
+    free  = data.get('free')
+    return {
+        'remote':   remote,
+        'total_gb': to_gb(total),
+        'used_gb':  to_gb(used),
+        'free_gb':  to_gb(free),
+        'used_pct': round(used / total * 100) if total and used else None,
+    }
+
+
 def action_sync_destinations(params, cfg):
     """Write backup_destinations.json from the destinations array. params: destinations list"""
     import json as _json
@@ -609,6 +638,7 @@ ACTIONS = {
     'verify_backup':    action_verify_backup,
     'restore_backup':        action_restore_backup,
     'test_rclone_remote':    action_test_rclone_remote,
+    'rclone_about':          action_rclone_about,
     'sync_destinations':     action_sync_destinations,
     'create_rclone_remote':  action_create_rclone_remote,
     'delete_rclone_remote':  action_delete_rclone_remote,
