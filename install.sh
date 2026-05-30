@@ -62,6 +62,17 @@ elif [[ -n "$ODOO_CONF" ]]; then
   ODOO_USER=$(stat -c '%U' "$ODOO_CONF" 2>/dev/null || echo "odoo17")
 fi
 
+# Odoo home directory (parent of odoo-bin's parent dir, e.g. /opt/odoo17)
+ODOO_HOME="/opt/odoo17"
+if [[ -n "$ODOO_BIN" ]]; then
+  # odoo-bin is at e.g. /opt/odoo17/odoo17/odoo-bin → home = /opt/odoo17
+  ODOO_HOME=$(dirname "$(dirname "$ODOO_BIN")")
+elif [[ -n "$ODOO_CONF" ]]; then
+  # Guess from conf path: /etc/odoo17.conf → check /opt/odoo17
+  VER=$(basename "$ODOO_CONF" .conf | sed 's/odoo//')
+  [[ -d "/opt/odoo${VER}" ]] && ODOO_HOME="/opt/odoo${VER}" || ODOO_HOME="/opt/odoo"
+fi
+
 # DB name from conf
 DB_NAME=""
 if [[ -n "$ODOO_CONF" ]]; then
@@ -77,8 +88,8 @@ for s in odoo17 odoo16 odoo; do
 done
 
 # Paths
-BACKUP_SCRIPT="/opt/odoo17/odoo_backup.sh"
-for p in /opt/odoo17/odoo_backup.sh /opt/odoo17/backup_to_onedrive.sh /opt/odoo/backup_to_onedrive.sh; do
+BACKUP_SCRIPT="$ODOO_HOME/odoo_backup.sh"
+for p in "$ODOO_HOME/odoo_backup.sh" "$ODOO_HOME/backup_to_onedrive.sh" /opt/odoo/backup_to_onedrive.sh; do
   [[ -f "$p" ]] && BACKUP_SCRIPT="$p" && break
 done
 
@@ -88,8 +99,8 @@ for p in /var/log/odoo/odoo17.log /var/log/odoo/odoo16.log /var/log/odoo/odoo.lo
   [[ -f "$p" ]] && ODOO_LOG="$p" && break
 done
 
-RCLONE_CONF="/opt/odoo17/rclone.conf"
-for p in /opt/odoo17/rclone.conf /opt/odoo16/rclone.conf /opt/odoo/rclone.conf; do
+RCLONE_CONF="$ODOO_HOME/rclone.conf"
+for p in "$ODOO_HOME/rclone.conf" /opt/odoo16/rclone.conf /opt/odoo/rclone.conf; do
   [[ -f "$p" ]] && RCLONE_CONF="$p" && break
 done
 
@@ -97,6 +108,7 @@ echo ""
 echo -e "  ${CYAN}Detected configuration:${NC}"
 echo "  ─────────────────────────────"
 echo "  Odoo user  : $ODOO_USER"
+echo "  Odoo home  : $ODOO_HOME"
 echo "  Python     : $PYTHON_BIN"
 echo "  odoo-bin   : ${ODOO_BIN:-not found}"
 echo "  odoo.conf  : ${ODOO_CONF:-not found}"
@@ -123,14 +135,14 @@ chown -R "$ODOO_USER:$ODOO_USER" "$AGENT_DIR"
 ok "Agent downloaded"
 
 # Download backup script if not already present
-if [ ! -f "/opt/odoo17/odoo_backup.sh" ]; then
+if [ ! -f "$ODOO_HOME/odoo_backup.sh" ]; then
     info "Downloading odoo_backup.sh..."
-    curl -fsSL "https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/odoo_backup.sh" -o /opt/odoo17/odoo_backup.sh
-    sed -i "s/YOUR_DB_NAME/$DB_NAME/" /opt/odoo17/odoo_backup.sh
-    chmod +x /opt/odoo17/odoo_backup.sh
-    chown "$ODOO_USER:$ODOO_USER" /opt/odoo17/odoo_backup.sh
-    BACKUP_SCRIPT="/opt/odoo17/odoo_backup.sh"
-    ok "Backup script installed at /opt/odoo17/odoo_backup.sh"
+    curl -fsSL "https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/odoo_backup.sh" -o "$ODOO_HOME/odoo_backup.sh"
+    sed -i "s/YOUR_DB_NAME/$DB_NAME/" "$ODOO_HOME/odoo_backup.sh"
+    chmod +x "$ODOO_HOME/odoo_backup.sh"
+    chown "$ODOO_USER:$ODOO_USER" "$ODOO_HOME/odoo_backup.sh"
+    BACKUP_SCRIPT="$ODOO_HOME/odoo_backup.sh"
+    ok "Backup script installed at $ODOO_HOME/odoo_backup.sh"
 else
     ok "Backup script already exists at $BACKUP_SCRIPT — skipping"
 fi
@@ -141,15 +153,17 @@ cat > /etc/serverchest-agent.conf << EOF
 [agent]
 relay_url     = $RELAY_URL
 api_key       = $API_KEY
+service_name  = $SERVICE_NAME
+odoo_user     = $ODOO_USER
+odoo_home     = $ODOO_HOME
+odoo_conf     = ${ODOO_CONF:-/etc/odoo17.conf}
+odoo_bin      = $PYTHON_BIN
+odoo_src      = ${ODOO_BIN:-$ODOO_HOME/odoo17/odoo-bin}
 backup_script = $BACKUP_SCRIPT
 backup_log    = $BACKUP_LOG
 odoo_log      = $ODOO_LOG
 rclone_config = $RCLONE_CONF
-odoo_conf     = ${ODOO_CONF:-/etc/odoo17.conf}
-odoo_bin      = $PYTHON_BIN
-odoo_src      = ${ODOO_BIN:-/opt/odoo17/odoo17/odoo-bin}
 db_name       = $DB_NAME
-service_name  = $SERVICE_NAME
 EOF
 chmod 600 /etc/serverchest-agent.conf
 ok "Config written to /etc/serverchest-agent.conf"
