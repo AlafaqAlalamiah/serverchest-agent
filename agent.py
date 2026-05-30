@@ -45,6 +45,8 @@ def load_config():
         'odoo_src':      s.get('odoo_src',       '/opt/odoo17/odoo17/odoo-bin'),
         'db_name':       s.get('db_name',        ''),
         'service_name':  s.get('service_name',   'odoo17'),
+        'odoo_user':     s.get('odoo_user',      'odoo17'),
+        'odoo_home':     s.get('odoo_home',      '/opt/odoo17'),
         'backup_remote': s.get('backup_remote',   ''),
     }
 
@@ -82,7 +84,8 @@ def action_ping(params, cfg):
 
 def action_get_disk_usage(params, cfg):
     result = {}
-    for label, path in [('root', '/'), ('odoo', '/opt/odoo17')]:
+    odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+    for label, path in [('root', '/'), ('odoo', odoo_home)]:
         if os.path.exists(path):
             u = shutil.disk_usage(path)
             result[label] = {
@@ -177,7 +180,7 @@ def action_get_backup_config(params, cfg):
     version_m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
     config['script_version'] = version_m.group(1).strip() if version_m else None
 
-    stdout, _, _ = _run(['crontab', '-u', 'odoo17', '-l'])
+    stdout, _, _ = _run(['crontab', '-u', cfg.get('odoo_user', 'odoo17'), '-l'])
     cron_schedule = '0 2 * * *'
     for line in stdout.splitlines():
         if script in line and not line.startswith('#'):
@@ -238,11 +241,12 @@ def action_set_backup_config(params, cfg):
 
     # Update cron
     if 'cron_schedule' in params:
-        stdout, _, _ = _run(['crontab', '-u', 'odoo17', '-l'])
+        odoo_user = cfg.get('odoo_user', 'odoo17')
+        stdout, _, _ = _run(['crontab', '-u', odoo_user, '-l'])
         lines = [l for l in stdout.splitlines() if script not in l]
         lines.append(f"{params['cron_schedule']} {script}")
         new_crontab = '\n'.join(lines) + '\n'
-        _run(['crontab', '-u', 'odoo17', '-'], input=new_crontab)
+        _run(['crontab', '-u', odoo_user, '-'], input=new_crontab)
 
     return {'status': 'saved'}
 
@@ -738,7 +742,7 @@ def action_sync_destinations(params, cfg):
     """Write backup_destinations.json from the destinations array. params: destinations list"""
     import json as _json
     destinations = params.get('destinations', [])
-    dest_file = '/opt/odoo17/backup_destinations.json'
+    dest_file = os.path.join(cfg.get('odoo_home', '/opt/odoo17'), 'backup_destinations.json')
     with open(dest_file, 'w') as f:
         _json.dump(destinations, f, indent=2)
     return {'ok': True, 'count': len(destinations), 'file': dest_file}
@@ -759,9 +763,9 @@ def action_list_databases(params, cfg):
                    if ln.strip() and not ln.strip().startswith('-')]
             return {'databases': dbs}
         last_err = stderr.strip() or stdout.strip() or f'psql rc={rc}'
-    # Fallback: sudo -u odoo17
+    # Fallback: sudo -u <odoo_user>
     stdout, stderr, rc = _run(
-        ['sudo', '-u', 'odoo17', 'psql', '-t', '-A', '-c', query], timeout=15)
+        ['sudo', '-u', cfg.get('odoo_user', 'odoo17'), 'psql', '-t', '-A', '-c', query], timeout=15)
     if rc == 0:
         dbs = [ln.strip() for ln in stdout.splitlines()
                if ln.strip() and not ln.strip().startswith('-')]
@@ -974,11 +978,14 @@ def action_test_webhook(params, cfg):
 
 
 # ── Maintenance mode ──────────────────────────────────────────────────────────
-_MAINTENANCE_FLAG = '/opt/odoo17/maintenance.flag'
+
+def _maintenance_flag(cfg):
+    return os.path.join(cfg.get('odoo_home', '/opt/odoo17'), 'maintenance.flag')
 
 def action_get_maintenance_status(params, cfg):
     """Return current maintenance mode status."""
     import json as _json
+    _MAINTENANCE_FLAG = _maintenance_flag(cfg)
     if os.path.exists(_MAINTENANCE_FLAG):
         try:
             with open(_MAINTENANCE_FLAG) as f:
@@ -993,7 +1000,7 @@ def action_enable_maintenance(params, cfg):
     import json as _json, datetime
     message = str(params.get('message', '') or 'System is under maintenance.')
     since = datetime.datetime.utcnow().isoformat() + 'Z'
-    with open(_MAINTENANCE_FLAG, 'w') as f:
+    with open(_maintenance_flag(cfg), 'w') as f:
         _json.dump({'since': since, 'message': message}, f)
     svc = cfg.get('service_name', 'odoo17')
     _, _, rc = _run(['systemctl', 'stop', svc], timeout=30)
@@ -1001,23 +1008,39 @@ def action_enable_maintenance(params, cfg):
 
 def action_disable_maintenance(params, cfg):
     """Disable maintenance mode: remove flag file and start Odoo service."""
-    if os.path.exists(_MAINTENANCE_FLAG):
-        os.remove(_MAINTENANCE_FLAG)
+    flag = _maintenance_flag(cfg)
+    if os.path.exists(flag):
+        os.remove(flag)
     svc = cfg.get('service_name', 'odoo17')
     _, _, rc = _run(['systemctl', 'start', svc], timeout=30)
     return {'active': False, 'service_started': rc == 0}
 
 
 # ── Odoo version & module info ────────────────────────────────────────────────
-_ODOO_CONF    = '/etc/odoo17.conf'
-_ODOO_RELEASE = '/opt/odoo17/odoo17/odoo/release.py'
 
 def action_get_odoo_info(params, cfg):
     result = {}
+    odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+    odoo_conf = cfg.get('odoo_conf', '/etc/odoo17.conf')
+    svc_name  = cfg.get('service_name', 'odoo17')
 
-    # 1. Odoo version
-    if os.path.isfile(_ODOO_RELEASE):
-        with open(_ODOO_RELEASE) as f:
+    # 1. Odoo version — look for release.py under odoo_src sibling or odoo_home
+    odoo_src = cfg.get('odoo_src', '')
+    # odoo_src is typically /opt/odoo17/odoo17/odoo-bin; release.py is at .../odoo/release.py
+    release_path = ''
+    if odoo_src:
+        src_dir = os.path.dirname(odoo_src)  # /opt/odoo17/odoo17
+        candidate = os.path.join(src_dir, 'odoo', 'release.py')
+        if os.path.isfile(candidate):
+            release_path = candidate
+    if not release_path:
+        # Fallback: scan odoo_home for release.py
+        for root, dirs, files in os.walk(odoo_home):
+            if 'release.py' in files and 'odoo' in os.path.basename(root):
+                release_path = os.path.join(root, 'release.py')
+                break
+    if release_path and os.path.isfile(release_path):
+        with open(release_path) as f:
             rc_txt = f.read()
         m = re.search(r"^version\s*=\s*'([^']+)'", rc_txt, re.MULTILINE)
         result['version'] = m.group(1) if m else None
@@ -1025,7 +1048,7 @@ def action_get_odoo_info(params, cfg):
         result['version'] = None
 
     # 2. Service status
-    out, _, _ = _run(['systemctl', 'show', 'odoo17',
+    out, _, _ = _run(['systemctl', 'show', svc_name,
                       '--property=ActiveState,SubState,ActiveEnterTimestamp'])
     svc = {}
     for line in out.splitlines():
@@ -1038,8 +1061,8 @@ def action_get_odoo_info(params, cfg):
 
     # 3. Odoo config: db_name + addons_path
     conf_txt = ''
-    if os.path.isfile(_ODOO_CONF):
-        with open(_ODOO_CONF) as f:
+    if os.path.isfile(odoo_conf):
+        with open(odoo_conf) as f:
             conf_txt = f.read()
     db_m = re.search(r'^\s*db_name\s*=\s*(\S+)', conf_txt, re.MULTILINE)
     db_name = db_m.group(1).strip() if db_m else ''
@@ -1071,7 +1094,7 @@ def action_get_odoo_info(params, cfg):
         query = ("SELECT name, installed_version, author "
                  "FROM ir_module_module WHERE state='installed' ORDER BY name;")
         out, _, rc = _run(
-            ['sudo', '-u', 'odoo17', 'psql', '-d', db_name, '-A', '-F', '\t', '-t', '-c', query],
+            ['sudo', '-u', cfg.get('odoo_user', 'odoo17'), 'psql', '-d', db_name, '-A', '-F', '\t', '-t', '-c', query],
             timeout=30
         )
         modules = []
