@@ -74,6 +74,7 @@ log "[INFO] Dump size: $DUMP_SIZE"
 # Read backup_destinations.json into parallel arrays (one call to python3)
 DEST_COUNT=0
 declare -a DEST_NAMES DEST_DB_PATHS DEST_FS_PATHS DEST_RETAIN_DAILY DEST_RETAIN_WEEKLY DEST_RETAIN_MONTHLY
+declare -a DEST_USE_DAILY DEST_USE_WEEKLY DEST_USE_MONTHLY
 
 if [ -f "$DESTINATIONS_FILE" ] && command -v python3 &>/dev/null; then
     _dest_env=$(python3 - "$DESTINATIONS_FILE" << 'PYEOF'
@@ -91,6 +92,9 @@ try:
     print("DEST_RETAIN_DAILY=(" + " ".join(str(d.get('retain_daily',7)) for d in dests) + ")")
     print("DEST_RETAIN_WEEKLY=(" + " ".join(str(d.get('retain_weekly',28)) for d in dests) + ")")
     print("DEST_RETAIN_MONTHLY=(" + " ".join(str(d.get('retain_monthly',365)) for d in dests) + ")")
+    print("DEST_USE_DAILY=(" + " ".join('true' if d.get('use_for_daily', True) else 'false' for d in dests) + ")")
+    print("DEST_USE_WEEKLY=(" + " ".join('true' if d.get('use_for_weekly', True) else 'false' for d in dests) + ")")
+    print("DEST_USE_MONTHLY=(" + " ".join('true' if d.get('use_for_monthly', True) else 'false' for d in dests) + ")")
 except Exception as e:
     print("DEST_COUNT=0")
     print(f"# destinations load error: {e}", file=sys.stderr)
@@ -107,35 +111,47 @@ upload_to_dest() {
     local retain_daily="$4"
     local retain_weekly="$5"
     local retain_monthly="$6"
+    local use_daily="${7:-true}"
+    local use_weekly="${8:-true}"
+    local use_monthly="${9:-true}"
 
     log "[INFO] === Destination: $dest_name ==="
+    local db_ok="ok" fs_ok="ok"
 
-    step_begin "Upload daily [$dest_name]"
-    rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
-        --log-level NOTICE --log-file "$RCLONE_LOG" \
-        || { log "[WARN] Upload failed for $dest_name (daily)"; return; }
-    step_end
+    if [ "$use_daily" = "true" ]; then
+        step_begin "Upload daily [$dest_name]"
+        rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
+            --log-level NOTICE --log-file "$RCLONE_LOG" \
+            || { log "[WARN] Upload failed for $dest_name (daily)"; db_ok="fail"; }
+        step_end
+    else
+        log "[SKIP] Daily upload disabled for $dest_name"
+    fi
 
-    if [ "$DAY_OF_WEEK" -eq 7 ]; then
+    if [ "$DAY_OF_WEEK" -eq 7 ] && [ "$use_weekly" = "true" ]; then
         step_begin "Upload weekly [$dest_name]"
         rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/weekly/db_weekly_$DATE.dump" \
             --log-level NOTICE --log-file "$RCLONE_LOG" \
             || log "[WARN] Upload failed for $dest_name (weekly)"
         step_end
+    elif [ "$DAY_OF_WEEK" -eq 7 ]; then
+        log "[SKIP] Weekly upload disabled for $dest_name"
     fi
 
-    if [ "$DAY_OF_MONTH" -eq 01 ]; then
+    if [ "$DAY_OF_MONTH" -eq 01 ] && [ "$use_monthly" = "true" ]; then
         step_begin "Upload monthly [$dest_name]"
         rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/monthly/db_monthly_$DATE.dump" \
             --log-level NOTICE --log-file "$RCLONE_LOG" \
             || log "[WARN] Upload failed for $dest_name (monthly)"
         step_end
+    elif [ "$DAY_OF_MONTH" -eq 01 ]; then
+        log "[SKIP] Monthly upload disabled for $dest_name"
     fi
 
     step_begin "Prune old backups [$dest_name]"
-    rclone --config "$RCLONE_CONFIG" delete "$db_path/daily/"   --min-age ${retain_daily}d  --log-level NOTICE --log-file "$RCLONE_LOG" || true
-    rclone --config "$RCLONE_CONFIG" delete "$db_path/weekly/"  --min-age ${retain_weekly}d --log-level NOTICE --log-file "$RCLONE_LOG" || true
-    rclone --config "$RCLONE_CONFIG" delete "$db_path/monthly/" --min-age ${retain_monthly}d --log-level NOTICE --log-file "$RCLONE_LOG" || true
+    [ "$use_daily"   = "true" ] && rclone --config "$RCLONE_CONFIG" delete "$db_path/daily/"   --min-age ${retain_daily}d  --log-level NOTICE --log-file "$RCLONE_LOG" || true
+    [ "$use_weekly"  = "true" ] && rclone --config "$RCLONE_CONFIG" delete "$db_path/weekly/"  --min-age ${retain_weekly}d --log-level NOTICE --log-file "$RCLONE_LOG" || true
+    [ "$use_monthly" = "true" ] && rclone --config "$RCLONE_CONFIG" delete "$db_path/monthly/" --min-age ${retain_monthly}d --log-level NOTICE --log-file "$RCLONE_LOG" || true
     step_end
 
     step_begin "Filestore sync [$dest_name]"
@@ -147,9 +163,10 @@ upload_to_dest() {
         --checksum \
         --log-level INFO \
         --log-file "$RCLONE_LOG" \
-        || log "[WARN] Filestore sync failed for $dest_name"
+        || { log "[WARN] Filestore sync failed for $dest_name"; fs_ok="fail"; }
     rclone_stats "$SYNC_START_LINE"
     step_end
+    log "[DEST_RESULT] name=${dest_name} db=${db_ok} fs=${fs_ok}"
 }
 
 # ─── Steps 2–4: Upload, prune, sync ──────────────────────────────────────────
@@ -162,7 +179,10 @@ if [ "$DEST_COUNT" -gt 0 ]; then
             "${DEST_FS_PATHS[$i]}" \
             "${DEST_RETAIN_DAILY[$i]}" \
             "${DEST_RETAIN_WEEKLY[$i]}" \
-            "${DEST_RETAIN_MONTHLY[$i]}"
+            "${DEST_RETAIN_MONTHLY[$i]}" \
+            "${DEST_USE_DAILY[$i]:-true}" \
+            "${DEST_USE_WEEKLY[$i]:-true}" \
+            "${DEST_USE_MONTHLY[$i]:-true}"
     done
 else
     # ─── Legacy single-destination mode ──────────────────────────────────────

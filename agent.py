@@ -10,6 +10,7 @@ Config file: /etc/serverchest-agent.conf
 
 import asyncio
 import configparser
+import datetime
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import urllib.request
 
 try:
     import websockets
@@ -120,12 +123,26 @@ def action_trigger_backup(params, cfg):
     script = cfg['backup_script']
     if not os.path.isfile(script):
         raise FileNotFoundError(f'Backup script not found: {script}')
+    # Record current log position so the watcher only looks at new output
+    log_path = cfg.get('backup_log', '/var/log/odoo/backup.log')
+    try:
+        start_pos = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
+    except Exception:
+        start_pos = 0
     subprocess.Popen(
         ['/bin/bash', script],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # Spawn background thread to watch for completion and fire webhook
+    server_name = cfg.get('server_name', '')
+    t = threading.Thread(
+        target=_watch_backup_log,
+        args=(log_path, start_pos, server_name),
+        daemon=True,
+    )
+    t.start()
     return {'status': 'triggered', 'script': script}
 
 def action_get_backup_config(params, cfg):
@@ -315,13 +332,32 @@ def action_service_status(params, cfg):
         pass
     return {'service': svc, 'active': is_active, 'http_ok': http_ok, 'systemctl_status': stdout.strip()}
 
+def action_get_journal(params, cfg):
+    svc = cfg['service_name']
+    n = max(1, min(int(params.get('n', 80)), 500))
+    stdout, stderr, rc = _run(
+        ['journalctl', '-u', svc, '-n', str(n), '--no-pager', '-o', 'short-iso'],
+        timeout=15,
+    )
+    return {'lines': stdout.splitlines(), 'service': svc}
+
 def action_service_control(params, cfg):
     svc = cfg['service_name']
-    action = params.get('action', '')
+    action = params.get('svc_action') or params.get('action', '')
     if action not in ('start', 'stop', 'restart'):
         raise ValueError(f'Invalid action: {action}')
     stdout, stderr, rc = _run(['sudo', 'systemctl', action, svc], timeout=60)
-    return {'action': action, 'service': svc, 'rc': rc, 'output': stdout + stderr}
+    # Brief settle time, then capture journal for caller
+    import time; time.sleep(2)
+    j_out, _, _ = _run(['journalctl', '-u', svc, '-n', '60', '--no-pager', '-o', 'short-iso'], timeout=10)
+    status_out, _, _ = _run(['systemctl', 'is-active', svc], timeout=5)
+    return {
+        'action': action,
+        'service': svc,
+        'rc': rc,
+        'active': status_out.strip() == 'active',
+        'journal': j_out.splitlines(),
+    }
 
 def action_get_odoo_info(params, cfg):
     """Query installed modules and Odoo version directly from PostgreSQL."""
@@ -708,6 +744,355 @@ def action_sync_destinations(params, cfg):
     return {'ok': True, 'count': len(destinations), 'file': dest_file}
 
 
+def action_list_databases(params, cfg):
+    """List PostgreSQL databases (excluding template/system DBs)."""
+    query = ("SELECT datname FROM pg_database "
+             "WHERE datistemplate = false AND datname NOT IN ('postgres') "
+             "ORDER BY datname")
+    connect_candidates = [c for c in [cfg.get('db_name', ''), 'template1', 'postgres'] if c]
+    last_err = 'psql not found'
+    for connect_db in connect_candidates:
+        stdout, stderr, rc = _run(
+            ['psql', '-d', connect_db, '-t', '-A', '-c', query], timeout=15)
+        if rc == 0:
+            dbs = [ln.strip() for ln in stdout.splitlines()
+                   if ln.strip() and not ln.strip().startswith('-')]
+            return {'databases': dbs}
+        last_err = stderr.strip() or stdout.strip() or f'psql rc={rc}'
+    # Fallback: sudo -u odoo17
+    stdout, stderr, rc = _run(
+        ['sudo', '-u', 'odoo17', 'psql', '-t', '-A', '-c', query], timeout=15)
+    if rc == 0:
+        dbs = [ln.strip() for ln in stdout.splitlines()
+               if ln.strip() and not ln.strip().startswith('-')]
+        return {'databases': dbs}
+    raise RuntimeError(f'list_databases failed: {last_err}')
+
+
+# ── SSH key management ────────────────────────────────────────────────────────
+
+def _auth_keys_path(user=''):
+    """Return authorized_keys path for user (or current effective user)."""
+    import pwd
+    if user:
+        try:
+            pw = pwd.getpwnam(user)
+            return os.path.join(pw.pw_dir, '.ssh', 'authorized_keys')
+        except KeyError:
+            raise RuntimeError(f'User not found: {user}')
+    home = os.path.expanduser('~')
+    return os.path.join(home, '.ssh', 'authorized_keys')
+
+def action_list_ssh_keys(params, cfg):
+    """List authorized SSH public keys."""
+    import tempfile
+    path = _auth_keys_path(params.get('user', ''))
+    if not os.path.exists(path):
+        return {'keys': [], 'path': path}
+    keys = []
+    with open(path) as f:
+        raw_lines = f.readlines()
+    for i, raw_line in enumerate(raw_lines):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        key_type = parts[0]
+        key_b64  = parts[1]
+        comment  = parts[2] if len(parts) > 2 else ''
+        # Get fingerprint via ssh-keygen using a temp file
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.pub', delete=False) as tf:
+                tf.write(line)
+                tmp = tf.name
+            stdout, _, rc = _run(['ssh-keygen', '-l', '-f', tmp], timeout=5)
+            fp_parts = stdout.strip().split()
+            fingerprint = fp_parts[1] if rc == 0 and len(fp_parts) >= 2 else 'unknown'
+        finally:
+            try: os.unlink(tmp)
+            except Exception: pass
+        keys.append({
+            'index':        i,
+            'type':         key_type,
+            'comment':      comment,
+            'fingerprint':  fingerprint,
+            'key_preview':  key_b64[:20] + '…',
+            'line_content': line,
+        })
+    return {'keys': keys, 'path': path}
+
+_SSH_KEY_TYPES = {
+    'ssh-rsa', 'ssh-ed25519', 'ssh-dss',
+    'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521',
+    'sk-ssh-ed25519@openssh.com', 'sk-ecdsa-sha2-nistp256@openssh.com',
+}
+
+def action_add_ssh_key(params, cfg):
+    """Append a public SSH key to authorized_keys."""
+    key = params.get('key', '').strip()
+    if not key:
+        raise ValueError('key is required')
+    parts = key.split(None, 2)
+    if len(parts) < 2 or parts[0] not in _SSH_KEY_TYPES:
+        raise ValueError(f'Invalid SSH public key format. Must start with one of: {", ".join(sorted(_SSH_KEY_TYPES))}')
+    key_b64 = parts[1]
+    path = _auth_keys_path(params.get('user', ''))
+    ssh_dir = os.path.dirname(path)
+    os.makedirs(ssh_dir, exist_ok=True)
+    os.chmod(ssh_dir, 0o700)
+    # Duplicate check
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                ep = line.strip().split(None, 2)
+                if len(ep) >= 2 and ep[1] == key_b64:
+                    raise ValueError('This key is already in authorized_keys')
+    with open(path, 'a') as f:
+        f.write(key + '\n')
+    os.chmod(path, 0o600)
+    return {'ok': True, 'path': path}
+
+def action_remove_ssh_key(params, cfg):
+    """Remove a specific key from authorized_keys by its full line content."""
+    line_content = params.get('line_content', '').strip()
+    if not line_content:
+        raise ValueError('line_content is required')
+    path = _auth_keys_path(params.get('user', ''))
+    if not os.path.exists(path):
+        raise RuntimeError('authorized_keys file not found')
+    with open(path) as f:
+        lines = f.readlines()
+    new_lines = [l for l in lines if l.strip() != line_content]
+    if len(new_lines) == len(lines):
+        raise RuntimeError('Key not found in authorized_keys')
+    with open(path, 'w') as f:
+        f.writelines(new_lines)
+    os.chmod(path, 0o600)
+    return {'ok': True}
+
+
+# ── Webhook ───────────────────────────────────────────────────────────────────
+_WEBHOOK_CFG = '/opt/serverchest-agent/webhook.json'
+
+def _load_webhook_cfg():
+    if not os.path.exists(_WEBHOOK_CFG):
+        return {'enabled': False, 'url': '', 'on_success': True, 'on_failure': True}
+    try:
+        with open(_WEBHOOK_CFG) as f:
+            return json.load(f)
+    except Exception:
+        return {'enabled': False, 'url': '', 'on_success': True, 'on_failure': True}
+
+def _fire_webhook(event, details, server_name=''):
+    """Fire webhook silently — never raises."""
+    try:
+        cfg = _load_webhook_cfg()
+        if not cfg.get('enabled') or not cfg.get('url', '').strip():
+            return
+        if event == 'success' and not cfg.get('on_success', True):
+            return
+        if event == 'failure' and not cfg.get('on_failure', True):
+            return
+        payload = json.dumps({
+            'event': event,
+            'server': server_name,
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+            **details,
+        }).encode()
+        req = urllib.request.Request(
+            cfg['url'].strip(),
+            data=payload,
+            headers={'Content-Type': 'application/json', 'User-Agent': 'ServerChest/1.0'},
+            method='POST',
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # always silent
+
+def _watch_backup_log(log_path, start_pos, server_name, timeout=7200):
+    """
+    Background thread: tail backup log from start_pos, detect SUCCESS/FAILED
+    line and fire webhook. Gives up after `timeout` seconds.
+    """
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(log_path) as f:
+                f.seek(start_pos)
+                new_text = f.read()
+            for line in new_text.splitlines():
+                lower = line.lower()
+                if 'backup completed successfully' in lower or '] success' in lower or 'backup success' in lower:
+                    _fire_webhook('success', {'message': line.strip()}, server_name)
+                    return
+                if 'backup failed' in lower or 'error:' in lower or '] failed' in lower or 'backup error' in lower:
+                    _fire_webhook('failure', {'message': line.strip()}, server_name)
+                    return
+        except Exception:
+            pass
+        time.sleep(15)
+
+def action_get_webhook_config(params, cfg):
+    return _load_webhook_cfg()
+
+def action_set_webhook_config(params, cfg):
+    current = _load_webhook_cfg()
+    for key in ('enabled', 'url', 'on_success', 'on_failure'):
+        if key in params:
+            current[key] = params[key]
+    os.makedirs(os.path.dirname(_WEBHOOK_CFG), exist_ok=True)
+    with open(_WEBHOOK_CFG, 'w') as f:
+        json.dump(current, f)
+    return current
+
+def action_test_webhook(params, cfg):
+    url = str(params.get('url', '') or _load_webhook_cfg().get('url', '')).strip()
+    if not url:
+        return {'error': 'No webhook URL configured'}
+    payload = json.dumps({
+        'event': 'test',
+        'server': cfg.get('server_name', 'serverchest'),
+        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+        'message': 'Test webhook from ServerChest',
+    }).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={'Content-Type': 'application/json', 'User-Agent': 'ServerChest/1.0'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return {'ok': True, 'http_status': r.status}
+    except urllib.error.HTTPError as e:
+        return {'ok': False, 'http_status': e.code, 'error': str(e)}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+# ── Maintenance mode ──────────────────────────────────────────────────────────
+_MAINTENANCE_FLAG = '/opt/odoo17/maintenance.flag'
+
+def action_get_maintenance_status(params, cfg):
+    """Return current maintenance mode status."""
+    import json as _json
+    if os.path.exists(_MAINTENANCE_FLAG):
+        try:
+            with open(_MAINTENANCE_FLAG) as f:
+                data = _json.load(f)
+        except Exception:
+            data = {}
+        return {'active': True, 'since': data.get('since'), 'message': data.get('message', '')}
+    return {'active': False, 'since': None, 'message': ''}
+
+def action_enable_maintenance(params, cfg):
+    """Enable maintenance mode: write flag file and stop Odoo service."""
+    import json as _json, datetime
+    message = str(params.get('message', '') or 'System is under maintenance.')
+    since = datetime.datetime.utcnow().isoformat() + 'Z'
+    with open(_MAINTENANCE_FLAG, 'w') as f:
+        _json.dump({'since': since, 'message': message}, f)
+    svc = cfg.get('service_name', 'odoo17')
+    _, _, rc = _run(['systemctl', 'stop', svc], timeout=30)
+    return {'active': True, 'since': since, 'message': message, 'service_stopped': rc == 0}
+
+def action_disable_maintenance(params, cfg):
+    """Disable maintenance mode: remove flag file and start Odoo service."""
+    if os.path.exists(_MAINTENANCE_FLAG):
+        os.remove(_MAINTENANCE_FLAG)
+    svc = cfg.get('service_name', 'odoo17')
+    _, _, rc = _run(['systemctl', 'start', svc], timeout=30)
+    return {'active': False, 'service_started': rc == 0}
+
+
+# ── Odoo version & module info ────────────────────────────────────────────────
+_ODOO_CONF    = '/etc/odoo17.conf'
+_ODOO_RELEASE = '/opt/odoo17/odoo17/odoo/release.py'
+
+def action_get_odoo_info(params, cfg):
+    result = {}
+
+    # 1. Odoo version
+    if os.path.isfile(_ODOO_RELEASE):
+        with open(_ODOO_RELEASE) as f:
+            rc_txt = f.read()
+        m = re.search(r"^version\s*=\s*'([^']+)'", rc_txt, re.MULTILINE)
+        result['version'] = m.group(1) if m else None
+    else:
+        result['version'] = None
+
+    # 2. Service status
+    out, _, _ = _run(['systemctl', 'show', 'odoo17',
+                      '--property=ActiveState,SubState,ActiveEnterTimestamp'])
+    svc = {}
+    for line in out.splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            svc[k] = v
+    result['service_state']    = svc.get('ActiveState')
+    result['service_substate'] = svc.get('SubState')
+    result['service_since']    = svc.get('ActiveEnterTimestamp')
+
+    # 3. Odoo config: db_name + addons_path
+    conf_txt = ''
+    if os.path.isfile(_ODOO_CONF):
+        with open(_ODOO_CONF) as f:
+            conf_txt = f.read()
+    db_m = re.search(r'^\s*db_name\s*=\s*(\S+)', conf_txt, re.MULTILINE)
+    db_name = db_m.group(1).strip() if db_m else ''
+    result['db_name'] = db_name
+
+    addons_m = re.search(r'^\s*addons_path\s*=\s*(.+)', conf_txt, re.MULTILINE)
+    all_paths = [p.strip() for p in addons_m.group(1).split(',')] if addons_m else []
+    standard_path = all_paths[0] if all_paths else ''
+    custom_paths  = all_paths[1:] if len(all_paths) > 1 else []
+
+    # 4. Custom addons from filesystem
+    custom_addons = []
+    for path in custom_paths:
+        if os.path.isdir(path):
+            for d in sorted(os.listdir(path)):
+                full = os.path.join(path, d)
+                if os.path.isdir(full) and not d.startswith(('.', '_')):
+                    manifest = os.path.join(full, '__manifest__.py')
+                    version = ''
+                    if os.path.isfile(manifest):
+                        with open(manifest) as mf:
+                            mv = re.search(r"'version'\s*:\s*'([^']+)'", mf.read())
+                            version = mv.group(1) if mv else ''
+                    custom_addons.append({'name': d, 'version': version, 'path': path})
+    result['custom_addons'] = custom_addons
+
+    # 5. Installed modules from PostgreSQL
+    if db_name and db_name not in ('False', 'false', ''):
+        query = ("SELECT name, installed_version, author "
+                 "FROM ir_module_module WHERE state='installed' ORDER BY name;")
+        out, _, rc = _run(
+            ['sudo', '-u', 'odoo17', 'psql', '-d', db_name, '-A', '-F', '\t', '-t', '-c', query],
+            timeout=30
+        )
+        modules = []
+        if rc == 0:
+            for line in out.strip().splitlines():
+                parts = line.split('\t')
+                if len(parts) >= 1 and parts[0]:
+                    modules.append({
+                        'name':    parts[0],
+                        'version': parts[1] if len(parts) > 1 else '',
+                        'author':  parts[2] if len(parts) > 2 else '',
+                    })
+        result['installed_modules'] = modules
+        result['installed_count']   = len(modules)
+    else:
+        result['installed_modules'] = []
+        result['installed_count']   = 0
+
+    return result
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -722,6 +1107,7 @@ ACTIONS = {
     'check_backup_script_update': action_check_backup_script_update,
     'service_status':     action_service_status,
     'service_control':    action_service_control,
+    'get_journal':        action_get_journal,
     'get_odoo_info':      action_get_odoo_info,
     'read_odoo_conf':     action_read_odoo_conf,
     'get_health':         action_get_health,
@@ -734,6 +1120,17 @@ ACTIONS = {
     'sync_destinations':     action_sync_destinations,
     'create_rclone_remote':  action_create_rclone_remote,
     'delete_rclone_remote':  action_delete_rclone_remote,
+    'list_databases':         action_list_databases,
+    'list_ssh_keys':          action_list_ssh_keys,
+    'add_ssh_key':            action_add_ssh_key,
+    'remove_ssh_key':         action_remove_ssh_key,
+    'get_maintenance_status': action_get_maintenance_status,
+    'enable_maintenance':     action_enable_maintenance,
+    'disable_maintenance':    action_disable_maintenance,
+    'get_webhook_config':     action_get_webhook_config,
+    'set_webhook_config':     action_set_webhook_config,
+    'test_webhook':           action_test_webhook,
+    'get_odoo_info':          action_get_odoo_info,
 }
 
 def dispatch(action, params, cfg):
@@ -843,6 +1240,22 @@ async def _monitor_loop(ws, cfg):
                             log.info('[monitor] Alert sent: backup_failed')
             except Exception as exc:
                 log.warning('[monitor] Backup check error: %s', exc)
+
+            # ── Health report (always emitted, every cycle) ───────────────────
+            try:
+                hr_status = action_service_status({}, cfg)
+                hr_disk   = action_get_disk_usage({}, cfg)
+                hr_worst  = max(hr_disk.values(), key=lambda x: x.get('used_pct', 0), default=None)
+                await ws.send(json.dumps({
+                    'type': 'health_report',
+                    'data': {
+                        'odoo_active': hr_status.get('active', False),
+                        'http_ok':     hr_status.get('http_ok', False),
+                        'disk_pct':    hr_worst.get('used_pct') if hr_worst else None,
+                    },
+                }))
+            except Exception as exc:
+                log.warning('[monitor] Health report error: %s', exc)
 
         except Exception as exc:
             log.warning('[monitor] Unexpected error: %s', exc)
