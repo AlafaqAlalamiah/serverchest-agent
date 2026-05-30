@@ -1246,7 +1246,7 @@ async def _monitor_loop(ws, cfg):
                     stdout, _, _ = _run(['tail', '-n', '300', log_path])
                     last_result = last_line = None
                     for line in reversed(stdout.splitlines()):
-                        if 'BACKUP COMPLETED' in line or 'SUCCESS' in line.upper():
+                        if 'BACKUP COMPLETE' in line.upper() or 'SUCCESS' in line.upper():
                             last_result, last_line = 'success', line[:40]
                             break
                         if 'FAILED' in line.upper() or 'ERROR' in line.upper():
