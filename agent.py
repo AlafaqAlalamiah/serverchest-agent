@@ -1776,6 +1776,7 @@ async def _receive_commands(ws, cfg):
 async def _monitor_loop(ws, cfg):
     """Background task: detect failures and push alert messages through the WebSocket."""
     cooldown = {}          # event_key -> monotonic timestamp of last alert sent
+    last_alerted_backup_line = None  # track which failure line we already alerted on
     await asyncio.sleep(30)  # brief startup delay
 
     while True:
@@ -1838,14 +1839,17 @@ async def _monitor_loop(ws, cfg):
                         if 'FAILED' in line.upper() or 'ERROR' in line.upper():
                             last_result, last_line = 'failed', line[:40]
                             break
-                    if last_result == 'failed':
-                        event = 'backup_failed'
-                        if loop_time - cooldown.get(event, 0) >= MONITOR_COOLDOWN:
+                    if last_result == 'success':
+                        last_alerted_backup_line = None  # reset so future failures alert
+                    elif last_result == 'failed':
+                        # Only alert once per unique failure line — not every 2 hours
+                        if last_line != last_alerted_backup_line:
+                            event = 'backup_failed'
                             await ws.send(json.dumps({
                                 'type': 'alert', 'event': event,
                                 'data': {'last_result': 'failed', 'log_excerpt': last_line or ''},
                             }))
-                            cooldown[event] = loop_time
+                            last_alerted_backup_line = last_line
                             log.info('[monitor] Alert sent: backup_failed')
             except Exception as exc:
                 log.warning('[monitor] Backup check error: %s', exc)
