@@ -1339,24 +1339,6 @@ def action_set_agent_config(params, cfg):
     return {'status': 'saved', 'updated': sorted(params.keys())}
 
 
-def action_list_databases(params, cfg):
-    """List all user PostgreSQL databases (excludes templates)."""
-    sql = (
-        "SELECT datname FROM pg_database "
-        "WHERE datistemplate = false AND datname <> 'postgres' "
-        "ORDER BY datname;"
-    )
-    out, _, rc = _run(['psql', '-d', 'postgres', '-t', '-A', '-c', sql], timeout=10)
-    if rc != 0:
-        # Fall back to connecting as the odoo user
-        out, _, rc = _run(['psql', '-t', '-A', '-c', sql], timeout=10)
-    databases = [
-        line.strip() for line in out.strip().splitlines()
-        if line.strip() and not line.strip().startswith('-')
-    ]
-    return {'databases': databases}
-
-
 def action_get_db_stats(params, cfg):
     """Return PostgreSQL performance metrics for the given (or configured) database."""
     db = params.get('db') or cfg.get('db_name') or 'odoodb'
