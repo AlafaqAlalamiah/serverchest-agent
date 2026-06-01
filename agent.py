@@ -870,47 +870,25 @@ def action_sync_destinations(params, cfg):
 
 
 def action_list_databases(params, cfg):
-    """List Odoo PostgreSQL databases (those containing ir_module_module table)."""
+    """List Odoo PostgreSQL databases (owned by the configured odoo_user role)."""
     odoo_user = cfg.get('odoo_user', 'odoo17')
-    all_dbs_query = (
+    query = (
         "SELECT datname FROM pg_database "
-        "WHERE datistemplate = false AND datname NOT IN ('postgres') "
+        "WHERE datistemplate = false "
+        "  AND datname NOT IN ('postgres') "
+        f"  AND pg_get_userbyid(datdba) = '{odoo_user}' "
         "ORDER BY datname"
     )
-    check_sql = ("SELECT 1 FROM pg_tables "
-                 "WHERE schemaname='public' AND tablename='ir_module_module' LIMIT 1")
-
-    def _psql(args, timeout=15):
-        out, _, rc = _run(args, timeout=timeout)
-        return out, rc == 0
-
-    # Get full list of candidate databases
-    all_dbs = None
     connect_candidates = [c for c in [cfg.get('db_name', ''), 'template1', 'postgres'] if c]
     for connect_db in connect_candidates:
-        out, ok = _psql(['psql', '-d', connect_db, '-t', '-A', '-c', all_dbs_query])
-        if ok:
-            all_dbs = [ln.strip() for ln in out.splitlines() if ln.strip()]
-            break
-    if all_dbs is None:
-        out, ok = _psql(['sudo', '-u', odoo_user, 'psql', '-t', '-A', '-c', all_dbs_query])
-        if ok:
-            all_dbs = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        else:
-            raise RuntimeError('list_databases: could not query pg_database')
-
-    # Filter: keep only databases that have Odoo's ir_module_module table
-    odoo_dbs = []
-    for db in all_dbs:
-        out, ok = _psql(['psql', '-d', db, '-t', '-A', '-c', check_sql], timeout=10)
-        if ok and out.strip():
-            odoo_dbs.append(db)
-            continue
-        out, ok = _psql(['sudo', '-u', odoo_user, 'psql', '-d', db, '-t', '-A', '-c', check_sql], timeout=10)
-        if ok and out.strip():
-            odoo_dbs.append(db)
-
-    return {'databases': odoo_dbs}
+        out, _, rc = _run(['psql', '-d', connect_db, '-t', '-A', '-c', query], timeout=15)
+        if rc == 0:
+            return {'databases': [ln.strip() for ln in out.splitlines() if ln.strip()]}
+    # Fallback: peer auth as odoo_user
+    out, _, rc = _run(['sudo', '-u', odoo_user, 'psql', '-t', '-A', '-c', query], timeout=15)
+    if rc == 0:
+        return {'databases': [ln.strip() for ln in out.splitlines() if ln.strip()]}
+    raise RuntimeError(f'list_databases: could not query pg_database as {odoo_user}')
 
 
 # ── SSH key management ────────────────────────────────────────────────────────
