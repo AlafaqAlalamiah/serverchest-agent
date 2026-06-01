@@ -1756,6 +1756,7 @@ DISK_MIN_PCT     = 70    # only send disk_warning if above this % (server checks
 
 async def _receive_commands(ws, cfg):
     """Handle incoming commands from the relay."""
+    loop = asyncio.get_event_loop()
     async for raw in ws:
         msg = json.loads(raw)
         if msg.get('type') != 'command':
@@ -1765,7 +1766,10 @@ async def _receive_commands(ws, cfg):
         params = msg.get('params', {})
         log.info('Executing action: %s (id=%s)', action, cmd_id)
         try:
-            data = dispatch(action, params, cfg)
+            # Run in a thread executor so blocking subprocess calls don't
+            # freeze the event loop and prevent WebSocket ping/pong handling.
+            import functools
+            data = await loop.run_in_executor(None, functools.partial(dispatch, action, params, cfg))
             response = {'type': 'response', 'id': cmd_id, 'data': data}
         except Exception as e:
             log.warning('Action %s failed: %s', action, e)
