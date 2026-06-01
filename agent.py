@@ -939,7 +939,13 @@ def action_test_rclone_remote(params, cfg):
     config_flag = ['--config', rclone_cfg] if rclone_cfg else []
     stdout, stderr, rc = _run([rclone] + config_flag + ['lsd', path, '--max-depth', '1'], timeout=20)
     if rc != 0:
-        raise RuntimeError(stderr.strip() or stdout.strip() or 'Connection failed')
+        combined = (stderr + stdout).strip()
+        # Directory doesn't exist yet — try creating it to verify write access
+        if 'directory not found' in combined or 'not found' in combined or 'doesn\'t exist' in combined:
+            _, mkdir_err, mkdir_rc = _run([rclone] + config_flag + ['mkdir', path], timeout=20)
+            if mkdir_rc == 0:
+                return {'ok': True, 'path': path, 'entries': 0, 'created': True}
+        raise RuntimeError(combined or 'Connection failed')
     entries = len([l for l in stdout.splitlines() if l.strip()])
     return {'ok': True, 'path': path, 'entries': entries}
 
