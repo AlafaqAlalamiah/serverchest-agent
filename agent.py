@@ -358,7 +358,7 @@ def action_update_agent(params, cfg):
     return {'ok': True, 'message': 'Agent updated — restarting in 2 seconds'}
 
 
-
+def action_update_backup_script(params, cfg):
     """Download the latest odoo_backup.sh template from GitHub, transplant the
     existing server-specific config values, and atomically replace the script."""
     import urllib.request, shutil, tempfile
