@@ -870,31 +870,47 @@ def action_sync_destinations(params, cfg):
 
 
 def action_list_databases(params, cfg):
-    """List Odoo PostgreSQL databases (owned by the configured odoo_user)."""
+    """List Odoo PostgreSQL databases (those containing ir_module_module table)."""
     odoo_user = cfg.get('odoo_user', 'odoo17')
-    query = (
+    all_dbs_query = (
         "SELECT datname FROM pg_database "
-        "WHERE datistemplate = false "
-        "  AND datname NOT IN ('postgres') "
-        f"  AND pg_get_userbyid(datdba) = '{odoo_user}' "
+        "WHERE datistemplate = false AND datname NOT IN ('postgres') "
         "ORDER BY datname"
     )
+    check_sql = ("SELECT 1 FROM pg_tables "
+                 "WHERE schemaname='public' AND tablename='ir_module_module' LIMIT 1")
+
+    def _psql(args, timeout=15):
+        out, _, rc = _run(args, timeout=timeout)
+        return out, rc == 0
+
+    # Get full list of candidate databases
+    all_dbs = None
     connect_candidates = [c for c in [cfg.get('db_name', ''), 'template1', 'postgres'] if c]
-    last_err = 'psql not found'
     for connect_db in connect_candidates:
-        stdout, stderr, rc = _run(
-            ['psql', '-d', connect_db, '-t', '-A', '-c', query], timeout=15)
-        if rc == 0:
-            dbs = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-            return {'databases': dbs}
-        last_err = stderr.strip() or stdout.strip() or f'psql rc={rc}'
-    # Fallback: peer auth as odoo_user (no -d needed)
-    stdout, stderr, rc = _run(
-        ['sudo', '-u', odoo_user, 'psql', '-t', '-A', '-c', query], timeout=15)
-    if rc == 0:
-        dbs = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-        return {'databases': dbs}
-    raise RuntimeError(f'list_databases failed: {last_err}')
+        out, ok = _psql(['psql', '-d', connect_db, '-t', '-A', '-c', all_dbs_query])
+        if ok:
+            all_dbs = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            break
+    if all_dbs is None:
+        out, ok = _psql(['sudo', '-u', odoo_user, 'psql', '-t', '-A', '-c', all_dbs_query])
+        if ok:
+            all_dbs = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        else:
+            raise RuntimeError('list_databases: could not query pg_database')
+
+    # Filter: keep only databases that have Odoo's ir_module_module table
+    odoo_dbs = []
+    for db in all_dbs:
+        out, ok = _psql(['psql', '-d', db, '-t', '-A', '-c', check_sql], timeout=10)
+        if ok and out.strip():
+            odoo_dbs.append(db)
+            continue
+        out, ok = _psql(['sudo', '-u', odoo_user, 'psql', '-d', db, '-t', '-A', '-c', check_sql], timeout=10)
+        if ok and out.strip():
+            odoo_dbs.append(db)
+
+    return {'databases': odoo_dbs}
 
 
 # ── SSH key management ────────────────────────────────────────────────────────
