@@ -870,26 +870,29 @@ def action_sync_destinations(params, cfg):
 
 
 def action_list_databases(params, cfg):
-    """List PostgreSQL databases (excluding template/system DBs)."""
-    query = ("SELECT datname FROM pg_database "
-             "WHERE datistemplate = false AND datname NOT IN ('postgres') "
-             "ORDER BY datname")
+    """List Odoo PostgreSQL databases (owned by the configured odoo_user)."""
+    odoo_user = cfg.get('odoo_user', 'odoo17')
+    query = (
+        "SELECT datname FROM pg_database "
+        "WHERE datistemplate = false "
+        "  AND datname NOT IN ('postgres') "
+        f"  AND pg_get_userbyid(datdba) = '{odoo_user}' "
+        "ORDER BY datname"
+    )
     connect_candidates = [c for c in [cfg.get('db_name', ''), 'template1', 'postgres'] if c]
     last_err = 'psql not found'
     for connect_db in connect_candidates:
         stdout, stderr, rc = _run(
             ['psql', '-d', connect_db, '-t', '-A', '-c', query], timeout=15)
         if rc == 0:
-            dbs = [ln.strip() for ln in stdout.splitlines()
-                   if ln.strip() and not ln.strip().startswith('-')]
+            dbs = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
             return {'databases': dbs}
         last_err = stderr.strip() or stdout.strip() or f'psql rc={rc}'
-    # Fallback: sudo -u <odoo_user>
+    # Fallback: peer auth as odoo_user (no -d needed)
     stdout, stderr, rc = _run(
-        ['sudo', '-u', cfg.get('odoo_user', 'odoo17'), 'psql', '-t', '-A', '-c', query], timeout=15)
+        ['sudo', '-u', odoo_user, 'psql', '-t', '-A', '-c', query], timeout=15)
     if rc == 0:
-        dbs = [ln.strip() for ln in stdout.splitlines()
-               if ln.strip() and not ln.strip().startswith('-')]
+        dbs = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
         return {'databases': dbs}
     raise RuntimeError(f'list_databases failed: {last_err}')
 
