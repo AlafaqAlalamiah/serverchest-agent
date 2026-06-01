@@ -326,8 +326,39 @@ def action_set_backup_config(params, cfg):
     return {'status': 'saved'}
 
 BACKUP_SCRIPT_URL = 'https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/odoo_backup.sh'
+AGENT_URL         = 'https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/agent.py'
 
-def action_update_backup_script(params, cfg):
+def action_update_agent(params, cfg):
+    """Download the latest agent.py from GitHub, replace the current file, and
+    schedule a delayed systemd restart so this response can be returned first."""
+    import urllib.request, tempfile, threading
+    agent_path = os.path.abspath(__file__)
+    try:
+        with urllib.request.urlopen(AGENT_URL, timeout=20) as resp:
+            new_content = resp.read()
+    except Exception as e:
+        raise RuntimeError(f'Failed to download agent: {e}')
+    # Validate it's Python
+    try:
+        compile(new_content, '<agent.py>', 'exec')
+    except SyntaxError as e:
+        raise RuntimeError(f'Downloaded agent has syntax error: {e}')
+    # Write atomically
+    agent_dir = os.path.dirname(agent_path)
+    with tempfile.NamedTemporaryFile('wb', dir=agent_dir, delete=False, suffix='.tmp') as tmp:
+        tmp.write(new_content)
+        tmp_path = tmp.name
+    os.chmod(tmp_path, 0o755)
+    os.replace(tmp_path, agent_path)
+    # Restart after 2 s so the response gets sent first
+    def _restart():
+        import time; time.sleep(2)
+        subprocess.Popen(['systemctl', 'restart', 'serverchest-agent'])
+    threading.Thread(target=_restart, daemon=True).start()
+    return {'ok': True, 'message': 'Agent updated — restarting in 2 seconds'}
+
+
+
     """Download the latest odoo_backup.sh template from GitHub, transplant the
     existing server-specific config values, and atomically replace the script."""
     import urllib.request, shutil, tempfile
@@ -1619,6 +1650,7 @@ ACTIONS = {
     'get_backup_config':    action_get_backup_config,
     'set_backup_config':    action_set_backup_config,
     'update_backup_script':       action_update_backup_script,
+    'update_agent':               action_update_agent,
     'check_backup_script_update': action_check_backup_script_update,
     'service_status':     action_service_status,
     'service_control':    action_service_control,
