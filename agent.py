@@ -329,33 +329,77 @@ BACKUP_SCRIPT_URL = 'https://raw.githubusercontent.com/AlafaqAlalamiah/serverche
 AGENT_URL         = 'https://raw.githubusercontent.com/AlafaqAlalamiah/serverchest-agent/main/agent.py'
 
 def action_update_agent(params, cfg):
-    """Download the latest agent.py from GitHub, replace the current file, and
-    schedule a delayed systemd restart so this response can be returned first."""
+    """Download the latest agent.py and odoo_backup.sh from GitHub.
+    Preserves all user-configured values in the backup script.
+    Schedules a delayed systemd restart so the response is returned first."""
     import urllib.request, tempfile, threading
+
+    # ── 1. Update agent.py ────────────────────────────────────────────────────
     agent_path = os.path.abspath(__file__)
     try:
         with urllib.request.urlopen(AGENT_URL, timeout=20) as resp:
-            new_content = resp.read()
+            agent_content = resp.read()
     except Exception as e:
         raise RuntimeError(f'Failed to download agent: {e}')
-    # Validate it's Python
     try:
-        compile(new_content, '<agent.py>', 'exec')
+        compile(agent_content, '<agent.py>', 'exec')
     except SyntaxError as e:
         raise RuntimeError(f'Downloaded agent has syntax error: {e}')
-    # Write atomically
     agent_dir = os.path.dirname(agent_path)
     with tempfile.NamedTemporaryFile('wb', dir=agent_dir, delete=False, suffix='.tmp') as tmp:
-        tmp.write(new_content)
+        tmp.write(agent_content)
         tmp_path = tmp.name
     os.chmod(tmp_path, 0o755)
     os.replace(tmp_path, agent_path)
-    # Restart after 2 s so the response gets sent first
+
+    # ── 2. Update odoo_backup.sh (preserve existing config values) ───────────
+    script = cfg.get('backup_script', '')
+    backup_updated = False
+    backup_error = None
+    if script:
+        existing = {}
+        if os.path.isfile(script):
+            with open(script) as f:
+                old = f.read()
+            def _get(var):
+                m = re.search(rf'^{var}=["\']?([^"\'\n]+)["\']?', old, re.MULTILINE)
+                return m.group(1).strip() if m else None
+            for var in ('DB_NAME', 'BACKUP_DIR', 'BACKUP_DB_REMOTE', 'BACKUP_FILESTORE_REMOTE',
+                        'RCLONE_CONFIG', 'CLEANUP_LOCAL', 'DESTINATIONS_FILE'):
+                v = _get(var)
+                if v:
+                    existing[var] = v
+        try:
+            with urllib.request.urlopen(BACKUP_SCRIPT_URL, timeout=15) as resp:
+                new_script = resp.read().decode()
+            for var, val in existing.items():
+                new_script = re.sub(
+                    rf'^({var}=)["\']?[^"\'\n]*["\']?',
+                    rf'\g<1>"{val}"',
+                    new_script, flags=re.MULTILINE
+                )
+            script_dir = os.path.dirname(script)
+            os.makedirs(script_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile('w', dir=script_dir, delete=False, suffix='.tmp') as tmp:
+                tmp.write(new_script)
+                tmp_path = tmp.name
+            os.chmod(tmp_path, 0o755)
+            os.replace(tmp_path, script)
+            backup_updated = True
+        except Exception as e:
+            backup_error = str(e)
+
+    # ── 3. Restart after 2 s so the response gets sent first ─────────────────
     def _restart():
         import time; time.sleep(2)
         subprocess.Popen(['systemctl', 'restart', 'serverchest-agent'])
     threading.Thread(target=_restart, daemon=True).start()
-    return {'ok': True, 'message': 'Agent updated — restarting in 2 seconds'}
+    return {
+        'ok': True,
+        'message': 'Agent updated — restarting in 2 seconds',
+        'backup_script_updated': backup_updated,
+        'backup_script_error': backup_error,
+    }
 
 
 def action_update_backup_script(params, cfg):
