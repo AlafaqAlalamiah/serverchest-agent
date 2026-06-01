@@ -815,6 +815,45 @@ def action_delete_rclone_remote(params, cfg):
 
 
 
+def action_get_rclone_remote_config(params, cfg):
+    """Return the rclone config dict for a single remote (for cross-server sharing). params: remote_name"""
+    import json as _json
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    name = params.get('remote_name', '').strip()
+    if not name:
+        raise ValueError('remote_name is required')
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    stdout, stderr, rc = _run([rclone] + config_flag + ['config', 'dump'], timeout=10)
+    if rc != 0:
+        raise RuntimeError(f'rclone config dump failed: {stderr.strip()}')
+    all_configs = _json.loads(stdout)
+    remote_cfg = all_configs.get(name)
+    if remote_cfg is None:
+        raise ValueError(f'Remote "{name}" not found in rclone config')
+    return {'ok': True, 'config': remote_cfg}
+
+
+def action_set_rclone_remote_config(params, cfg):
+    """Create/overwrite an rclone remote from a stored config dict (cross-server setup). params: remote_name, config"""
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    name = params.get('remote_name', '').strip()
+    remote_cfg = params.get('config') or {}
+    rtype = remote_cfg.get('type', '').strip()
+    if not name or not rtype:
+        raise ValueError('remote_name and config.type are required')
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    cmd = [rclone] + config_flag + ['config', 'create', name, rtype, '--non-interactive']
+    for k, v in remote_cfg.items():
+        if k != 'type' and v:
+            cmd += [str(k), str(v)]
+    stdout, stderr, rc = _run(cmd, timeout=15)
+    if rc != 0:
+        raise RuntimeError(f'rclone config create failed: {stderr.strip() or stdout.strip()}')
+    return {'ok': True}
+
+
 def action_test_rclone_remote(params, cfg):
     """Test rclone remote connectivity by listing a path. params: path (e.g. onedrive:Odoo-Backups/database)"""
     rclone = shutil.which('rclone') or 'rclone'
@@ -1596,8 +1635,10 @@ ACTIONS = {
     'rclone_about':          action_rclone_about,
     'get_dest_health':       action_get_dest_health,
     'sync_destinations':     action_sync_destinations,
-    'create_rclone_remote':  action_create_rclone_remote,
-    'delete_rclone_remote':  action_delete_rclone_remote,
+    'create_rclone_remote':      action_create_rclone_remote,
+    'delete_rclone_remote':      action_delete_rclone_remote,
+    'get_rclone_remote_config':  action_get_rclone_remote_config,
+    'set_rclone_remote_config':  action_set_rclone_remote_config,
     'list_databases':         action_list_databases,
     'list_ssh_keys':          action_list_ssh_keys,
     'add_ssh_key':            action_add_ssh_key,
