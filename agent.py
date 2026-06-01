@@ -945,7 +945,7 @@ def action_list_databases(params, cfg):
     query = (
         "SELECT datname FROM pg_database "
         "WHERE datistemplate = false "
-        "  AND datname NOT IN ('postgres') "
+        "  AND datname NOT IN ('postgres', '--stop-after-init') "
         f"  AND pg_get_userbyid(datdba) = '{odoo_user}' "
         "ORDER BY datname"
     )
