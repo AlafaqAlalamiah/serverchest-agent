@@ -166,6 +166,7 @@ rclone_config = $RCLONE_CONF
 db_name       = $DB_NAME
 EOF
 chmod 600 /etc/serverchest-agent.conf
+chown "$ODOO_USER:$ODOO_USER" /etc/serverchest-agent.conf
 ok "Config written to /etc/serverchest-agent.conf"
 
 # ── Systemd service ───────────────────────────────────────────────────────────

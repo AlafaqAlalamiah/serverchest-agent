@@ -9,6 +9,7 @@ Config file: /etc/serverchest-agent.conf
 """
 
 import asyncio
+import collections
 import configparser
 import datetime
 import json
@@ -69,6 +70,62 @@ def _human_size(n):
 def _run(cmd, timeout=30, input=None):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
     return r.stdout, r.stderr, r.returncode
+
+# ── System metrics ring buffer ────────────────────────────────────────────────
+# Keeps the last 6 hours of 1-minute samples (360 points) in memory.
+# Survives WS reconnects — only cleared on agent restart.
+_metrics_samples  = collections.deque(maxlen=360)
+_metrics_prev_cpu = None   # (busy_jiffies, total_jiffies)
+_metrics_prev_net = None   # (rx_bytes, tx_bytes, monotonic_time)
+
+def _proc_cpu_times():
+    """Return (busy, total) jiffies from /proc/stat, or (None, None) on error."""
+    try:
+        with open('/proc/stat') as f:
+            parts = f.readline().split()
+        vals = [int(x) for x in parts[1:]]
+        # user nice system idle iowait irq softirq steal …
+        idle  = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        total = sum(vals[:8]) if len(vals) >= 8 else sum(vals)
+        busy  = total - idle
+        return busy, total
+    except Exception:
+        return None, None
+
+def _proc_mem():
+    """Return (used_mb, total_mb, pct) from /proc/meminfo."""
+    try:
+        mem = {}
+        with open('/proc/meminfo') as f:
+            for line in f:
+                k, v = line.split(':')
+                mem[k.strip()] = int(v.split()[0])  # values in kB
+        total_kb = mem.get('MemTotal', 0)
+        avail_kb = mem.get('MemAvailable', 0)
+        used_kb  = total_kb - avail_kb
+        pct      = round(used_kb / total_kb * 100, 1) if total_kb else 0.0
+        return round(used_kb / 1024, 1), round(total_kb / 1024, 1), pct
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+def _proc_net():
+    """Return total (rx_bytes, tx_bytes) across all non-loopback interfaces."""
+    try:
+        rx = tx = 0
+        with open('/proc/net/dev') as f:
+            for line in f:
+                line = line.strip()
+                if ':' not in line:
+                    continue
+                iface, data = line.split(':', 1)
+                if iface.strip() == 'lo':
+                    continue
+                fields = data.split()
+                rx += int(fields[0])
+                tx += int(fields[8])
+        return rx, tx
+    except Exception:
+        return 0, 0
 
 # ── Action handlers ───────────────────────────────────────────────────────────
 
@@ -177,6 +234,12 @@ def action_get_backup_config(params, cfg):
     cleanup_m = re.search(r'^CLEANUP_LOCAL=["\']?(true|false)["\']?', content, re.MULTILINE | re.IGNORECASE)
     config['cleanup_local'] = (cleanup_m.group(1).lower() == 'true') if cleanup_m else True
 
+    pre_hook_m = re.search(r'^PRE_HOOK=["\']?([^"\'\n]*)["\']?', content, re.MULTILINE)
+    config['pre_hook'] = pre_hook_m.group(1).strip() if pre_hook_m else ''
+
+    post_hook_m = re.search(r'^POST_HOOK=["\']?([^"\'\n]*)["\']?', content, re.MULTILINE)
+    config['post_hook'] = post_hook_m.group(1).strip() if post_hook_m else ''
+
     version_m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
     config['script_version'] = version_m.group(1).strip() if version_m else None
 
@@ -235,6 +298,18 @@ def action_set_backup_config(params, cfg):
                 rf'\g<1>CLEANUP_LOCAL="{val}"\n',
                 content, count=1
             )
+
+    if 'pre_hook' in params:
+        if re.search(r'^PRE_HOOK=', content, re.MULTILINE):
+            _set('PRE_HOOK', params['pre_hook'])
+        else:
+            content = re.sub(r'(CLEANUP_LOCAL=.*?\n)', rf'\g<1>PRE_HOOK="{params["pre_hook"]}"\n', content, count=1)
+
+    if 'post_hook' in params:
+        if re.search(r'^POST_HOOK=', content, re.MULTILINE):
+            _set('POST_HOOK', params['post_hook'])
+        else:
+            content = re.sub(r'(PRE_HOOK=.*?\n)', rf'\g<1>POST_HOOK="{params["post_hook"]}"\n', content, count=1)
 
     with open(script, 'w') as f:
         f.write(content)
@@ -410,6 +485,52 @@ def action_read_odoo_conf(params, cfg):
     parser.read(conf_path)
     options = dict(parser['options']) if 'options' in parser else {}
     return {'options': options, 'raw': content, 'path': conf_path}
+
+
+def action_write_odoo_conf(params, cfg):
+    """Update the Odoo config file. Pass 'options' dict for selective key updates,
+    or 'raw' string for a full text replacement. A .bak backup is always created first."""
+    conf_path = cfg.get('odoo_conf', '/etc/odoo17.conf')
+    if not os.path.isfile(conf_path):
+        raise FileNotFoundError(f'Config not found: {conf_path}')
+
+    # Always back up before any write
+    bak_path = conf_path + '.serverchest.bak'
+    with open(conf_path) as f:
+        original = f.read()
+    with open(bak_path, 'w') as f:
+        f.write(original)
+
+    if 'raw' in params:
+        with open(conf_path, 'w') as f:
+            f.write(params['raw'])
+        return {'status': 'saved', 'mode': 'raw', 'path': conf_path, 'backup': bak_path}
+
+    if 'restore_backup' in params and params['restore_backup']:
+        if not os.path.isfile(bak_path):
+            raise FileNotFoundError(f'No backup found at {bak_path}')
+        with open(bak_path) as f:
+            bak_content = f.read()
+        with open(conf_path, 'w') as f:
+            f.write(bak_content)
+        return {'status': 'saved', 'mode': 'restore', 'path': conf_path}
+
+    if 'options' in params:
+        updates = params['options']
+        if not isinstance(updates, dict):
+            raise ValueError('options must be a dict')
+        parser = configparser.ConfigParser()
+        parser.read(conf_path)
+        if 'options' not in parser:
+            parser['options'] = {}
+        for key, val in updates.items():
+            parser['options'][key] = str(val)
+        with open(conf_path, 'w') as f:
+            parser.write(f)
+        return {'status': 'saved', 'mode': 'form', 'updated': sorted(updates.keys()),
+                'path': conf_path, 'backup': bak_path}
+
+    raise ValueError('Provide either "options" (dict) or "raw" (string)')
 
 
 def action_get_health(params, cfg):
@@ -1042,8 +1163,14 @@ def action_get_odoo_info(params, cfg):
     if release_path and os.path.isfile(release_path):
         with open(release_path) as f:
             rc_txt = f.read()
+        # Try literal string assignment: version = '17.0'
         m = re.search(r"^version\s*=\s*'([^']+)'", rc_txt, re.MULTILINE)
-        result['version'] = m.group(1) if m else None
+        if m and m.group(1) not in ('.', ''):
+            result['version'] = m.group(1)
+        else:
+            # Fall back to version_info tuple: version_info = (17, 0, 0, ...)
+            m2 = re.search(r'version_info\s*=\s*\((\d+),\s*(\d+)', rc_txt)
+            result['version'] = f"{m2.group(1)}.{m2.group(2)}" if m2 else None
     else:
         result['version'] = None
 
@@ -1059,19 +1186,37 @@ def action_get_odoo_info(params, cfg):
     result['service_substate'] = svc.get('SubState')
     result['service_since']    = svc.get('ActiveEnterTimestamp')
 
-    # 3. Odoo config: db_name + addons_path
+    # 3. Read odoo.conf for addons_path
     conf_txt = ''
     if os.path.isfile(odoo_conf):
         with open(odoo_conf) as f:
             conf_txt = f.read()
-    db_m = re.search(r'^\s*db_name\s*=\s*(\S+)', conf_txt, re.MULTILINE)
-    db_name = db_m.group(1).strip() if db_m else ''
-    result['db_name'] = db_name
 
     addons_m = re.search(r'^\s*addons_path\s*=\s*(.+)', conf_txt, re.MULTILINE)
     all_paths = [p.strip() for p in addons_m.group(1).split(',')] if addons_m else []
-    standard_path = all_paths[0] if all_paths else ''
-    custom_paths  = all_paths[1:] if len(all_paths) > 1 else []
+    custom_paths = all_paths[1:] if len(all_paths) > 1 else []
+
+    # 3a. List all Odoo-owned databases from PostgreSQL
+    odoo_user = cfg.get('odoo_user', 'odoo17')
+    db_list_sql = (
+        "SELECT datname FROM pg_database d "
+        "JOIN pg_roles r ON d.datdba = r.oid "
+        "WHERE r.rolname = '" + odoo_user + "' "
+        "AND d.datname NOT IN ('template0','template1','postgres','--stop-after-init') "
+        "ORDER BY datname;"
+    )
+    db_list_out, _, db_list_rc = _run(['psql', '-t', '-A', '-c', db_list_sql], timeout=10)
+    databases = [l.strip() for l in db_list_out.strip().splitlines() if l.strip()] if db_list_rc == 0 else []
+    result['databases'] = databases
+
+    # 3b. Determine which database to query for modules/size
+    # Priority: explicit param > agent config > first database in list
+    db_name = (params.get('db_name') or '').strip()
+    if not db_name:
+        db_name = cfg.get('db_name', '').strip()
+    if not db_name and databases:
+        db_name = databases[0]
+    result['db_name'] = db_name
 
     # 4. Custom addons from filesystem
     custom_addons = []
@@ -1089,14 +1234,21 @@ def action_get_odoo_info(params, cfg):
                     custom_addons.append({'name': d, 'version': version, 'path': path})
     result['custom_addons'] = custom_addons
 
-    # 5. Installed modules from PostgreSQL
-    if db_name and db_name not in ('False', 'false', ''):
-        query = ("SELECT name, installed_version, author "
+    # 5. Installed modules + DB size from PostgreSQL
+    def _human(n):
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if n < 1024: return f'{n:.1f} {unit}'
+            n /= 1024
+        return f'{n:.1f} PB'
+
+    if db_name and db_name not in ('False', 'false', '', 'False,'):
+        query = ("SELECT name, latest_version, author "
                  "FROM ir_module_module WHERE state='installed' ORDER BY name;")
-        out, _, rc = _run(
-            ['sudo', '-u', cfg.get('odoo_user', 'odoo17'), 'psql', '-d', db_name, '-A', '-F', '\t', '-t', '-c', query],
-            timeout=30
-        )
+        # Try sudo psql first, fall back to plain psql (matches agent run context)
+        psql_cmd_base = ['sudo', '-u', cfg.get('odoo_user', 'odoo17'), 'psql']
+        out, _, rc = _run(psql_cmd_base + ['-d', db_name, '-A', '-F', '\t', '-t', '-c', query], timeout=30)
+        if rc != 0:
+            out, _, rc = _run(['psql', '-d', db_name, '-A', '-F', '\t', '-t', '-c', query], timeout=30)
         modules = []
         if rc == 0:
             for line in out.strip().splitlines():
@@ -1109,11 +1261,333 @@ def action_get_odoo_info(params, cfg):
                     })
         result['installed_modules'] = modules
         result['installed_count']   = len(modules)
+
+        # DB size — try plain psql (no sudo) first since agent may run as postgres-accessible user
+        size_sql = f"SELECT pg_database_size('{db_name}')"
+        size_out, _, size_rc = _run(['psql', '-d', db_name, '-t', '-A', '-c', size_sql], timeout=10)
+        if size_rc != 0:
+            size_out, _, size_rc = _run(psql_cmd_base + ['-d', db_name, '-t', '-A', '-c', size_sql], timeout=10)
+        if size_rc == 0 and size_out.strip().isdigit():
+            db_size_bytes = int(size_out.strip())
+            result['db_size_bytes'] = db_size_bytes
+            result['db_size'] = _human(db_size_bytes)
     else:
         result['installed_modules'] = []
         result['installed_count']   = 0
 
     return result
+
+
+def action_get_metrics(params, cfg):
+    """Return the in-memory metrics ring buffer (up to 360 samples, one per minute)."""
+    return {'samples': list(_metrics_samples)}
+
+
+# ── Agent config read / write ─────────────────────────────────────────────────
+
+_EDITABLE_CFG_KEYS = frozenset({
+    'db_name', 'service_name', 'odoo_conf', 'odoo_user',
+    'odoo_home', 'odoo_bin', 'odoo_src',
+    'odoo_log', 'backup_log', 'backup_script', 'backup_remote', 'rclone_config',
+})
+
+def action_get_agent_config(params, cfg):
+    """Return the editable agent config values."""
+    return {k: cfg.get(k, '') for k in sorted(_EDITABLE_CFG_KEYS)}
+
+def action_set_agent_config(params, cfg):
+    """Write editable keys to CONFIG_FILE and update the in-memory cfg dict."""
+    unknown = set(params) - _EDITABLE_CFG_KEYS
+    if unknown:
+        raise ValueError(f'Non-editable keys: {sorted(unknown)}')
+    if not params:
+        raise ValueError('No keys provided')
+
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG_FILE)
+    if 'agent' not in parser:
+        parser['agent'] = {}
+
+    for key, val in params.items():
+        parser['agent'][key] = str(val)
+
+    with open(CONFIG_FILE, 'w') as f:
+        parser.write(f)
+
+    # Mutate in-memory cfg so changes apply immediately (no restart needed)
+    cfg.update({k: str(v) for k, v in params.items()})
+
+    return {'status': 'saved', 'updated': sorted(params.keys())}
+
+
+def action_list_databases(params, cfg):
+    """List all user PostgreSQL databases (excludes templates)."""
+    sql = (
+        "SELECT datname FROM pg_database "
+        "WHERE datistemplate = false AND datname <> 'postgres' "
+        "ORDER BY datname;"
+    )
+    out, _, rc = _run(['psql', '-d', 'postgres', '-t', '-A', '-c', sql], timeout=10)
+    if rc != 0:
+        # Fall back to connecting as the odoo user
+        out, _, rc = _run(['psql', '-t', '-A', '-c', sql], timeout=10)
+    databases = [
+        line.strip() for line in out.strip().splitlines()
+        if line.strip() and not line.strip().startswith('-')
+    ]
+    return {'databases': databases}
+
+
+def action_get_db_stats(params, cfg):
+    """Return PostgreSQL performance metrics for the given (or configured) database."""
+    db = params.get('db') or cfg.get('db_name') or 'odoodb'
+
+    # ── Connection counts by state ─────────────────────────────────────────
+    conn_sql = (
+        "SELECT COALESCE(state, 'other'), count(*) "
+        "FROM pg_stat_activity "
+        "WHERE datname = current_database() GROUP BY state;"
+    )
+    conn_out, _, conn_rc = _run(
+        ['psql', '-d', db, '-t', '-A', '-F', '\t', '-c', conn_sql], timeout=10
+    )
+    connections = {'active': 0, 'idle': 0, 'idle_in_transaction': 0, 'total': 0}
+    if conn_rc == 0:
+        for line in conn_out.strip().splitlines():
+            parts = line.split('\t')
+            if len(parts) == 2:
+                state = (parts[0] or '').strip()
+                cnt   = int(parts[1].strip() or 0)
+                if state == 'active':
+                    connections['active'] = cnt
+                elif state == 'idle':
+                    connections['idle'] = cnt
+                elif 'idle in transaction' in state:
+                    connections['idle_in_transaction'] = cnt
+                connections['total'] += cnt
+
+    # ── Max connections ────────────────────────────────────────────────────
+    mc_out, _, mc_rc = _run(
+        ['psql', '-d', db, '-t', '-A', '-c', 'SHOW max_connections;'], timeout=5
+    )
+    max_conn = int(mc_out.strip()) if mc_rc == 0 and mc_out.strip().isdigit() else None
+
+    # ── Longest running query (seconds) ───────────────────────────────────
+    lq_sql = (
+        "SELECT COALESCE(EXTRACT(EPOCH FROM now() - query_start)::int, 0) "
+        "FROM pg_stat_activity "
+        "WHERE state = 'active' AND datname = current_database() "
+        "AND query NOT LIKE '%pg_stat_activity%' "
+        "ORDER BY query_start ASC LIMIT 1;"
+    )
+    lq_out, _, lq_rc = _run(
+        ['psql', '-d', db, '-t', '-A', '-c', lq_sql], timeout=10
+    )
+    val = lq_out.strip()
+    longest_sec = int(val) if lq_rc == 0 and val.lstrip('-').isdigit() else 0
+    longest_sec = max(0, longest_sec)
+
+    # ── DB size ────────────────────────────────────────────────────────────
+    size_sql = (
+        f"SELECT pg_size_pretty(pg_database_size('{db}')), "
+        f"pg_database_size('{db}');"
+    )
+    sz_out, _, sz_rc = _run(
+        ['psql', '-d', db, '-t', '-A', '-F', '\t', '-c', size_sql], timeout=10
+    )
+    db_size, db_size_bytes = '?', 0
+    if sz_rc == 0 and sz_out.strip():
+        parts = sz_out.strip().split('\t')
+        db_size       = parts[0].strip() if parts else '?'
+        db_size_bytes = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip().isdigit() else 0
+
+    return {
+        'connections':       connections,
+        'max_connections':   max_conn,
+        'longest_query_sec': longest_sec,
+        'db_size':           db_size,
+        'db_size_bytes':     db_size_bytes,
+        'db':                db,
+    }
+
+
+# ── Metrics sampler (runs independently of WebSocket connection) ──────────────
+async def _metrics_sampler_loop():
+    """Collect CPU / RAM / network / disk samples every 60 s into _metrics_samples."""
+    global _metrics_prev_cpu, _metrics_prev_net
+    import asyncio as _aio
+
+    # Baseline reads (no sample yet — we need two readings to compute a delta)
+    _metrics_prev_cpu = _proc_cpu_times()
+    _metrics_prev_net = (*_proc_net(), _aio.get_event_loop().time())
+    await _aio.sleep(60)
+
+    while True:
+        try:
+            now = datetime.datetime.utcnow().isoformat() + 'Z'
+
+            # CPU %
+            busy, total = _proc_cpu_times()
+            if _metrics_prev_cpu and _metrics_prev_cpu[1] is not None and total:
+                pb, pt = _metrics_prev_cpu
+                dt = total - pt
+                cpu_pct = round((busy - pb) / dt * 100, 1) if dt > 0 else 0.0
+                cpu_pct = max(0.0, min(100.0, cpu_pct))
+            else:
+                cpu_pct = 0.0
+            _metrics_prev_cpu = (busy, total)
+
+            # RAM
+            ram_used_mb, ram_total_mb, ram_pct = _proc_mem()
+
+            # Network KB/s
+            rx, tx      = _proc_net()
+            t_now       = _aio.get_event_loop().time()
+            if _metrics_prev_net:
+                prx, ptx, pt = _metrics_prev_net
+                elapsed      = max(t_now - pt, 1)
+                rx_kbps      = round((rx - prx) / elapsed / 1024, 1)
+                tx_kbps      = round((tx - ptx) / elapsed / 1024, 1)
+                rx_kbps      = max(0.0, rx_kbps)
+                tx_kbps      = max(0.0, tx_kbps)
+            else:
+                rx_kbps = tx_kbps = 0.0
+            _metrics_prev_net = (rx, tx, t_now)
+
+            # Disk (root partition %)
+            try:
+                d = shutil.disk_usage('/')
+                disk_pct = round(d.used / d.total * 100, 1)
+            except Exception:
+                disk_pct = 0.0
+
+            _metrics_samples.append({
+                'ts':          now,
+                'cpu':         cpu_pct,
+                'ram':         ram_pct,
+                'ram_used_mb': ram_used_mb,
+                'ram_total_mb': ram_total_mb,
+                'rx_kbps':     rx_kbps,
+                'tx_kbps':     tx_kbps,
+                'disk':        disk_pct,
+            })
+            log.debug('[metrics] cpu=%.1f%% ram=%.1f%% rx=%.1fKB/s tx=%.1fKB/s',
+                      cpu_pct, ram_pct, rx_kbps, tx_kbps)
+        except Exception as exc:
+            log.warning('[metrics] Sample error: %s', exc)
+
+        await _aio.sleep(60)
+
+
+def action_get_system_paths(params, cfg):
+    """Return suggested paths for the system backup wizard."""
+    odoo_home  = cfg.get('odoo_home', '/opt/odoo17')
+    odoo_conf  = cfg.get('odoo_conf', '/etc/odoo17.conf')
+
+    addons_paths = []
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(odoo_conf)
+        raw = parser.get('options', 'addons_path', fallback='')
+        addons_paths = [p.strip() for p in raw.split(',') if p.strip()]
+    except Exception:
+        pass
+
+    def path_info(p):
+        return {'path': p, 'exists': os.path.exists(p)}
+
+    return {
+        'odoo_home':    path_info(odoo_home),
+        'addons_paths': [path_info(p) for p in addons_paths],
+    }
+
+
+def action_system_backup(params, cfg):
+    """Archive the specified paths with tar+gzip and upload via rclone."""
+    import datetime
+    items       = list(params.get('items', []))
+    destination = params.get('destination', '').strip()
+
+    if not items:
+        raise ValueError('No paths specified')
+    if not destination:
+        raise ValueError('No destination specified')
+
+    missing = [p for p in items if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(f'Paths not found: {", ".join(missing)}')
+
+    ts           = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    archive_name = f'system_backup_{ts}.tar.gz'
+    tmp_dir      = '/tmp/serverchest_sysbackup'
+    os.makedirs(tmp_dir, exist_ok=True)
+    archive_path = os.path.join(tmp_dir, archive_name)
+
+    try:
+        # Create archive (ignore socket files which can't be archived)
+        tar_cmd = ['tar', '--ignore-failed-read', '-czf', archive_path] + items
+        _, err, rc = _run(tar_cmd, timeout=3600)
+        if rc not in (0, 1):   # exit 1 = non-fatal warnings (socket files etc.)
+            raise RuntimeError(f'Archive failed: {err.strip()}')
+
+        size_bytes = os.path.getsize(archive_path)
+
+        rclone_cfg = cfg.get('rclone_config', '')
+        cmd = ['rclone']
+        if rclone_cfg:
+            cmd += ['--config', rclone_cfg]
+        cmd += ['copy', archive_path, destination]
+        _, err, rc = _run(cmd, timeout=3600)
+        if rc != 0:
+            raise RuntimeError(f'Upload failed: {err.strip()}')
+
+        return {
+            'status':      'ok',
+            'archive':     archive_name,
+            'size':        _human_size(size_bytes),
+            'size_bytes':  size_bytes,
+            'destination': destination,
+            'items':       items,
+        }
+    finally:
+        try:
+            if os.path.exists(archive_path):
+                os.remove(archive_path)
+        except Exception:
+            pass
+
+
+def action_get_dest_health(params, cfg):
+    """Check the most recent upload to an rclone destination path (last 30 days).
+    params: path (full rclone path, e.g. 'onedrive:Odoo-Backups/database')
+    returns: { ok, latest: { ts, name, size } | null, error? }
+    """
+    import json as _json
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    path = params.get('path', '').strip()
+    if not path:
+        raise ValueError('path is required')
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    cmd = [rclone] + config_flag + ['lsjson', '--recursive', '--files-only', '--max-age', '30d', path]
+    stdout, stderr, rc = _run(cmd, timeout=30)
+    if rc != 0:
+        return {'ok': False, 'error': (stderr.strip() or 'rclone error').splitlines()[0], 'latest': None}
+    try:
+        files = _json.loads(stdout) if stdout.strip() else []
+    except Exception as e:
+        return {'ok': False, 'error': f'parse error: {e}', 'latest': None}
+    if not files:
+        return {'ok': True, 'latest': None}
+    latest = max(files, key=lambda f: f.get('ModTime', ''))
+    return {
+        'ok': True,
+        'latest': {
+            'name': latest.get('Name', ''),
+            'ts':   latest.get('ModTime', ''),
+            'size': latest.get('Size', 0),
+        }
+    }
 
 
 # ── Dispatch table ────────────────────────────────────────────────────────────
@@ -1133,6 +1607,7 @@ ACTIONS = {
     'get_journal':        action_get_journal,
     'get_odoo_info':      action_get_odoo_info,
     'read_odoo_conf':     action_read_odoo_conf,
+    'write_odoo_conf':    action_write_odoo_conf,
     'get_health':         action_get_health,
     'dump_database':      action_dump_database,
     'list_backups':     action_list_backups,
@@ -1140,6 +1615,7 @@ ACTIONS = {
     'restore_backup':        action_restore_backup,
     'test_rclone_remote':    action_test_rclone_remote,
     'rclone_about':          action_rclone_about,
+    'get_dest_health':       action_get_dest_health,
     'sync_destinations':     action_sync_destinations,
     'create_rclone_remote':  action_create_rclone_remote,
     'delete_rclone_remote':  action_delete_rclone_remote,
@@ -1154,7 +1630,15 @@ ACTIONS = {
     'set_webhook_config':     action_set_webhook_config,
     'test_webhook':           action_test_webhook,
     'get_odoo_info':          action_get_odoo_info,
+    'get_metrics':            action_get_metrics,
+    'get_agent_config':       action_get_agent_config,
+    'set_agent_config':       action_set_agent_config,
+    'list_databases':         action_list_databases,
+    'get_db_stats':           action_get_db_stats,
+    'get_system_paths':       action_get_system_paths,
+    'system_backup':          action_system_backup,
 }
+
 
 def dispatch(action, params, cfg):
     if action not in ACTIONS:
@@ -1292,6 +1776,10 @@ async def agent_loop(cfg):
     if not api_key:
         log.error('api_key not set in %s — cannot connect', CONFIG_FILE)
         sys.exit(1)
+
+    # Start the metrics sampler once; it runs for the lifetime of the process
+    # regardless of WebSocket connection state.
+    asyncio.create_task(_metrics_sampler_loop())
 
     backoff = 2
     while True:

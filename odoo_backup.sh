@@ -14,6 +14,8 @@ LOG_FILE="/var/log/odoo/backup.log"
 RCLONE_LOG="/var/log/odoo/rclone_detail.log"
 RCLONE_CONFIG="/opt/odoo17/rclone.conf"
 CLEANUP_LOCAL="true"
+PRE_HOOK=""    # Optional shell command to run BEFORE backup (e.g. put Odoo in maintenance)
+POST_HOOK=""   # Optional shell command to run AFTER successful backup
 DESTINATIONS_FILE="/opt/odoo17/backup_destinations.json"
 
 DATE=$(date +%Y%m%d_%H%M)
@@ -38,6 +40,29 @@ step_end() {
     [ $min -gt 0 ] && log "[DONE] $CURRENT_STEP — ${min}m ${sec}s" || log "[DONE] $CURRENT_STEP — ${sec}s"
 }
 
+# ─── ServerChest backup-report (webhook + log sync) ───────────────────────────
+_SC_CONF="/etc/serverchest-agent.conf"
+_SC_API_KEY=""
+_SC_APP_URL=""
+if [ -f "$_SC_CONF" ]; then
+    _SC_API_KEY=$(awk -F'[[:space:]]*=[[:space:]]*' '/^api_key/{print $2; exit}' "$_SC_CONF")
+    _SC_RELAY=$(awk  -F'[[:space:]]*=[[:space:]]*' '/^relay_url/{print $2; exit}' "$_SC_CONF")
+    # Derive app base URL: wss://app.serverchest.com/ws/agent → https://app.serverchest.com
+    _SC_APP_URL=$(echo "$_SC_RELAY" | sed 's|^wss://|https://|; s|/ws/.*||')
+fi
+
+report_backup() {
+    local status="$1"  # success | failed
+    local secs=$(( SECONDS - BACKUP_START ))
+    [ -z "$_SC_API_KEY" ] || [ -z "$_SC_APP_URL" ] && return 0
+    curl -sf --max-time 10 \
+        -X POST "$_SC_APP_URL/api/internal/backup-report" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $_SC_API_KEY" \
+        -d "{\"status\":\"$status\",\"at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"duration_secs\":$secs,\"db\":\"$DB_NAME\",\"dump_size_bytes\":${DUMP_SIZE_BYTES:-0}}" \
+        > /dev/null 2>&1 || true
+}
+
 # Extract stats written by rclone to RCLONE_LOG since $1 (line number)
 rclone_stats() {
     local since_line="$1"
@@ -48,12 +73,19 @@ rclone_stats() {
     [ -n "$stats" ] && log "[STATS] $stats"
 }
 
-trap 'log "[ERROR] Failed at step: $CURRENT_STEP"; log "===== Backup FAILED ====="; [ "${CLEANUP_LOCAL:-true}" = "true" ] && rm -f "${DUMP_FILE:-}" 2>/dev/null || true' ERR
+trap 'log "[ERROR] Failed at step: $CURRENT_STEP"; log "===== Backup FAILED ====="; [ "${CLEANUP_LOCAL:-true}" = "true" ] && rm -f "${DUMP_FILE:-}" 2>/dev/null || true; report_backup failed' ERR
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 touch "$RCLONE_LOG" 2>/dev/null || true
 log "===== Backup started ====="
 echo "=== rclone run: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$RCLONE_LOG"
+
+# ─── Pre-hook ─────────────────────────────────────────────────────────────────
+if [ -n "${PRE_HOOK:-}" ]; then
+    step_begin "Pre-hook"
+    eval "$PRE_HOOK" || { log "[WARN] Pre-hook exited non-zero — continuing"; }
+    step_end
+fi
 
 # ─── Step 1: Database dump ────────────────────────────────────────────────────
 step_begin "Database dump"
@@ -67,6 +99,7 @@ else
 fi
 
 DUMP_SIZE=$(du -sh "$DUMP_FILE" | cut -f1)
+DUMP_SIZE_BYTES=$(stat -c%s "$DUMP_FILE" 2>/dev/null || stat -f%z "$DUMP_FILE" 2>/dev/null || echo 0)
 step_end
 log "[INFO] Dump size: $DUMP_SIZE"
 
@@ -196,8 +229,16 @@ fi
 
 if [ "${CLEANUP_LOCAL:-true}" = "true" ]; then rm -f "$DUMP_FILE" 2>/dev/null || true; log "[INFO] Local dump deleted"; fi
 
+# ─── Post-hook ────────────────────────────────────────────────────────────────
+if [ -n "${POST_HOOK:-}" ]; then
+    step_begin "Post-hook"
+    eval "$POST_HOOK" || { log "[WARN] Post-hook exited non-zero — continuing"; }
+    step_end
+fi
+
 # ─── Done ─────────────────────────────────────────────────────────────────────
 TOTAL_SECS=$(( SECONDS - BACKUP_START ))
 TOTAL_MIN=$(( TOTAL_SECS / 60 ))
 TOTAL_SEC=$(( TOTAL_SECS % 60 ))
 log "===== Backup complete — total: ${TOTAL_MIN}m ${TOTAL_SEC}s ====="
+report_backup success
