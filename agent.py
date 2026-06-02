@@ -979,6 +979,27 @@ def action_rclone_about(params, cfg):
     }
 
 
+def action_rclone_ls(params, cfg):
+    """List files/folders in an rclone path. params: remote (str), path (str, optional). Returns items list."""
+    import json as _json
+    rclone = shutil.which('rclone') or 'rclone'
+    rclone_cfg = cfg.get('rclone_config', '')
+    remote = params.get('remote', '').strip()
+    if not remote:
+        raise ValueError('remote is required')
+    sub_path = params.get('path', '').strip().strip('/')
+    rclone_path = remote.rstrip(':') + ':' + sub_path
+    config_flag = ['--config', rclone_cfg] if rclone_cfg else []
+    stdout, stderr, rc = _run(
+        [rclone] + config_flag + ['lsjson', rclone_path, '--no-modtime', '--no-mimetype', '--max-depth', '1'],
+        timeout=30,
+    )
+    if rc != 0:
+        raise RuntimeError(stderr.strip() or stdout.strip() or 'rclone lsjson failed')
+    items = _json.loads(stdout)
+    return {'items': items, 'path': sub_path}
+
+
 def action_sync_destinations(params, cfg):
     """Write backup_destinations.json from the destinations array. params: destinations list"""
     import json as _json
@@ -1715,6 +1736,7 @@ ACTIONS = {
     'restore_backup':        action_restore_backup,
     'test_rclone_remote':    action_test_rclone_remote,
     'rclone_about':          action_rclone_about,
+    'rclone_ls':             action_rclone_ls,
     'get_dest_health':       action_get_dest_health,
     'sync_destinations':     action_sync_destinations,
     'create_rclone_remote':      action_create_rclone_remote,
