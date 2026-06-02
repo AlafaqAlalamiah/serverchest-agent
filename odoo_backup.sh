@@ -151,6 +151,12 @@ upload_to_dest() {
     log "[INFO] === Destination: $dest_name ==="
     local db_ok="ok" fs_ok="ok"
 
+    # Skip entirely if no tier is enabled for this destination
+    if [ "$use_daily" != "true" ] && [ "$use_weekly" != "true" ] && [ "$use_monthly" != "true" ]; then
+        log "[SKIP] $dest_name — not configured for any backup tier"
+        return 0
+    fi
+
     if [ "$use_daily" = "true" ]; then
         step_begin "Upload daily [$dest_name]"
         rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
