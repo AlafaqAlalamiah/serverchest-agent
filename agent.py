@@ -1779,17 +1779,22 @@ async def _receive_commands(ws, cfg):
 
 async def _monitor_loop(ws, cfg):
     """Background task: detect failures and push alert messages through the WebSocket."""
+    import functools
     cooldown = {}          # event_key -> monotonic timestamp of last alert sent
     last_alerted_backup_line = None  # track which failure line we already alerted on
     await asyncio.sleep(30)  # brief startup delay
+    loop = asyncio.get_event_loop()
 
     while True:
         try:
-            loop_time = asyncio.get_event_loop().time()
+            loop_time = loop.time()
+
+            # Run all blocking checks in the thread executor so the event loop
+            # stays free to handle WebSocket ping/pong frames.
 
             # ── Odoo service check ────────────────────────────────────────────
             try:
-                status = action_service_status({}, cfg)
+                status = await loop.run_in_executor(None, functools.partial(action_service_status, {}, cfg))
                 if not (status['active'] and status['http_ok']):
                     event = 'odoo_down'
                     if loop_time - cooldown.get(event, 0) >= MONITOR_COOLDOWN:
@@ -1808,7 +1813,7 @@ async def _monitor_loop(ws, cfg):
 
             # ── Disk usage check ──────────────────────────────────────────────
             try:
-                disk = action_get_disk_usage({}, cfg)
+                disk = await loop.run_in_executor(None, functools.partial(action_get_disk_usage, {}, cfg))
                 worst = max(disk.values(), key=lambda x: x.get('used_pct', 0), default=None)
                 if worst and worst.get('used_pct', 0) >= DISK_MIN_PCT:
                     event = 'disk_warning'
@@ -1834,7 +1839,7 @@ async def _monitor_loop(ws, cfg):
             try:
                 log_path = cfg['backup_log']
                 if os.path.isfile(log_path):
-                    stdout, _, _ = _run(['tail', '-n', '300', log_path])
+                    stdout, _, _ = await loop.run_in_executor(None, lambda: _run(['tail', '-n', '300', log_path]))
                     last_result = last_line = None
                     for line in reversed(stdout.splitlines()):
                         if 'BACKUP COMPLETE' in line.upper() or 'SUCCESS' in line.upper():
@@ -1860,8 +1865,8 @@ async def _monitor_loop(ws, cfg):
 
             # ── Health report (always emitted, every cycle) ───────────────────
             try:
-                hr_status = action_service_status({}, cfg)
-                hr_disk   = action_get_disk_usage({}, cfg)
+                hr_status = await loop.run_in_executor(None, functools.partial(action_service_status, {}, cfg))
+                hr_disk   = await loop.run_in_executor(None, functools.partial(action_get_disk_usage, {}, cfg))
                 hr_worst  = max(hr_disk.values(), key=lambda x: x.get('used_pct', 0), default=None)
                 await ws.send(json.dumps({
                     'type': 'health_report',
