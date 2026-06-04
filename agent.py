@@ -478,9 +478,17 @@ def action_update_agent(params, cfg):
     # ── 3. Restart after 2 s so the response gets sent first ─────────────────
     def _restart():
         import time; time.sleep(2)
-        # The agent runs as a non-root user so systemctl restart won't work.
-        # Instead, exit the process — systemd Restart=always will relaunch it
-        # with the updated agent.py already on disk.
+        # Try sudo systemctl restart first (works when sudoers rule is installed).
+        # Fall back to os._exit(0) which lets systemd Restart=always relaunch us.
+        try:
+            r = subprocess.run(
+                ['sudo', 'systemctl', 'restart', 'serverchest-agent'],
+                timeout=5, capture_output=True,
+            )
+            if r.returncode == 0:
+                return
+        except Exception:
+            pass
         os._exit(0)
     threading.Thread(target=_restart, daemon=True).start()
     return {
