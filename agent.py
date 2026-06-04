@@ -206,6 +206,56 @@ def action_trigger_backup(params, cfg):
     return {'status': 'triggered', 'script': script}
 
 
+def action_get_backup_config(params, cfg):
+    script = cfg['backup_script']
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f'Script not found: {script}')
+    with open(script) as f:
+        content = f.read()
+
+    def _get(var):
+        m = re.search(rf'^{var}=["\']?([^"\'\n]+)["\']?', content, re.MULTILINE)
+        return m.group(1).strip() if m else ''
+
+    config = {
+        'db_name':            _get('DB_NAME'),
+        'backup_dir':         _get('BACKUP_DIR'),
+        'db_remote':        _get('BACKUP_DB_REMOTE'),
+        'filestore_remote': _get('BACKUP_FILESTORE_REMOTE'),
+        'rclone_config':      _get('RCLONE_CONFIG'),
+        'script_path':        script,
+    }
+    daily_m   = re.search(r'daily.*?--min-age\s+(\d+)d',   content)
+    weekly_m  = re.search(r'weekly.*?--min-age\s+(\d+)d',  content)
+    monthly_m = re.search(r'monthly.*?--min-age\s+(\d+)d', content)
+    config['retain_daily_days']   = daily_m.group(1)   if daily_m   else '7'
+    config['retain_weekly_days']  = weekly_m.group(1)  if weekly_m  else '28'
+    config['retain_monthly_days'] = monthly_m.group(1) if monthly_m else '365'
+
+    cleanup_m = re.search(r'^CLEANUP_LOCAL=["\']?(true|false)["\']?', content, re.MULTILINE | re.IGNORECASE)
+    config['cleanup_local'] = (cleanup_m.group(1).lower() == 'true') if cleanup_m else True
+
+    pre_hook_m = re.search(r'^PRE_HOOK=["\']?([^"\'\n]*)["\']?', content, re.MULTILINE)
+    config['pre_hook'] = pre_hook_m.group(1).strip() if pre_hook_m else ''
+
+    post_hook_m = re.search(r'^POST_HOOK=["\']?([^"\'\n]*)["\']?', content, re.MULTILINE)
+    config['post_hook'] = post_hook_m.group(1).strip() if post_hook_m else ''
+
+    version_m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
+    config['script_version'] = version_m.group(1).strip() if version_m else None
+
+    stdout, _, _ = _run(['crontab', '-u', cfg.get('odoo_user', 'odoo17'), '-l'])
+    cron_schedule = '0 2 * * *'
+    for line in stdout.splitlines():
+        if script in line and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) >= 5:
+                cron_schedule = ' '.join(parts[:5])
+            break
+    config['cron_schedule'] = cron_schedule
+    return config
+
+
 def action_run_manual_backup(params, cfg):
     """Run a one-off manual database backup to specific rclone destinations (synchronous)."""
     import tempfile as _tempfile
