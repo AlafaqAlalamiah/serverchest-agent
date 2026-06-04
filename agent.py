@@ -257,7 +257,7 @@ def action_get_backup_config(params, cfg):
 
 
 def action_run_manual_backup(params, cfg):
-    """Run a one-off manual database backup to specific rclone destinations (synchronous)."""
+    """Run a one-off manual backup (DB dump + filestore sync) to specific rclone destinations."""
     import tempfile as _tempfile
     import datetime as _dt
 
@@ -272,6 +272,8 @@ def action_run_manual_backup(params, cfg):
     rclone_conf = cfg.get('rclone_config', '')
     base_rclone = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
     log_path = cfg.get('backup_log', '/var/log/odoo/backup.log')
+    odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+    filestore_local = os.path.join(odoo_home, '.local', 'share', 'Odoo', 'filestore', db)
     start_dt = _dt.datetime.now()
 
     def write_log(msg):
@@ -286,9 +288,10 @@ def action_run_manual_backup(params, cfg):
     try:
         write_log('[MANUAL] Backup started')
 
+        # ── 1. Database dump ──────────────────────────────────────────────────
         dump_file = os.path.join(tmp_dir, f'{db}_manual.dump')
         log.info('[manual_backup] Dumping database %s', db)
-        out, err, rc = _run(['pg_dump', '-Fc', '-d', db, '-f', dump_file], timeout=600)
+        _, err, rc = _run(['pg_dump', '-Fc', '-d', db, '-f', dump_file], timeout=600)
         if rc != 0:
             write_log('Backup FAILED step: dump')
             raise RuntimeError(f'pg_dump failed (rc={rc}): {err.strip()[:300]}')
@@ -296,6 +299,14 @@ def action_run_manual_backup(params, cfg):
         dump_size = os.path.getsize(dump_file)
         write_log(f'[INFO] Dump size: {_human_size(dump_size)}')
 
+        # ── 2. Filestore size ─────────────────────────────────────────────────
+        has_filestore = os.path.isdir(filestore_local)
+        if has_filestore:
+            out, _, _ = _run(['du', '-sh', filestore_local], timeout=30)
+            fs_size = out.split()[0] if out.strip() else '?'
+            write_log(f'[INFO] Filestore size: {fs_size}')
+
+        # ── 3. Upload to each destination ─────────────────────────────────────
         ts_str = start_dt.strftime('%Y%m%d_%H%M')
         remote_filename = f'{db}_manual_{ts_str}.dump'
         dest_results = []
@@ -304,26 +315,45 @@ def action_run_manual_backup(params, cfg):
         for dest in destinations:
             name = dest.get('name', 'unknown')
             db_path = (dest.get('dbPath') or '').rstrip('/')
+            fs_path = (dest.get('fsPath') or '').rstrip('/')
+
+            db_ok = 'ok'
+            fs_ok = 'ok'
+
+            # DB upload
             if not db_path:
-                dest_results.append({'name': name, 'status': 'failed', 'error': 'no dbPath configured'})
-                write_log(f'[DEST_RESULT] name={name} db=fail fs=na')
+                db_ok = 'fail'
                 any_failed = True
-                continue
-            remote_path = f'{db_path}/manual/{remote_filename}'
-            log.info('[manual_backup] Uploading to %s', remote_path)
-            _, err, rc = _run(base_rclone + ['copyto', dump_file, remote_path], timeout=300)
-            if rc == 0:
-                dest_results.append({'name': name, 'status': 'ok', 'path': remote_path})
-                write_log(f'[DEST_RESULT] name={name} db=ok fs=na')
             else:
-                dest_results.append({'name': name, 'status': 'failed', 'error': err.strip()[:200]})
-                write_log(f'[DEST_RESULT] name={name} db=fail fs=na')
-                any_failed = True
+                remote_path = f'{db_path}/manual/{remote_filename}'
+                log.info('[manual_backup] Uploading DB to %s', remote_path)
+                _, err, rc = _run(base_rclone + ['copyto', dump_file, remote_path], timeout=300)
+                if rc != 0:
+                    db_ok = 'fail'
+                    any_failed = True
+                    log.warning('[manual_backup] DB upload failed for %s: %s', name, err.strip()[:200])
+
+            # Filestore sync
+            if has_filestore and fs_path:
+                log.info('[manual_backup] Syncing filestore to %s', fs_path)
+                _, err, rc = _run(
+                    base_rclone + ['sync', filestore_local, fs_path,
+                                   '--transfers', '8', '--checksum'],
+                    timeout=1800,
+                )
+                if rc != 0:
+                    fs_ok = 'fail'
+                    log.warning('[manual_backup] Filestore sync failed for %s: %s', name, err.strip()[:200])
+            elif not fs_path or not has_filestore:
+                fs_ok = 'na'
+
+            write_log(f'[DEST_RESULT] name={name} db={db_ok} fs={fs_ok}')
+            dest_results.append({'name': name, 'db': db_ok, 'fs': fs_ok})
 
         if any_failed:
             write_log('Backup FAILED step: rclone_db')
-            failed_names = [d['name'] for d in dest_results if d['status'] != 'ok']
-            raise RuntimeError(f'Upload failed for: {", ".join(failed_names)}')
+            failed = [d['name'] for d in dest_results if d['db'] != 'ok']
+            raise RuntimeError(f'DB upload failed for: {", ".join(failed)}')
 
         elapsed = int((_dt.datetime.now() - start_dt).total_seconds())
         mins, secs = divmod(elapsed, 60)
@@ -334,6 +364,7 @@ def action_run_manual_backup(params, cfg):
             'db': db,
             'dump_size': dump_size,
             'dump_size_human': _human_size(dump_size),
+            'filestore_size': fs_size if has_filestore else None,
             'destinations': dest_results,
         }
     except Exception:
@@ -342,9 +373,8 @@ def action_run_manual_backup(params, cfg):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def action_set_backup_config(params, cfg):
     script = cfg['backup_script']
-    if not os.path.isfile(script):
-        raise FileNotFoundError(f'Script not found: {script}')
     with open(script) as f:
         content = f.read()
 
