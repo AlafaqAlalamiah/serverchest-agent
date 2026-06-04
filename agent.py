@@ -912,7 +912,7 @@ def action_verify_backup(params, cfg):
     db_path = None
     db_size = 0
     db_size_human = ''
-    for tier in ('daily', 'weekly', 'monthly'):
+    for tier in ('daily', 'weekly', 'monthly', 'manual'):
         stdout, _, rc = _run(base_cmd + [f'{db_remote}/{tier}/'], timeout=30)
         if rc != 0 or not stdout.strip():
             continue
