@@ -205,7 +205,93 @@ def action_trigger_backup(params, cfg):
     t.start()
     return {'status': 'triggered', 'script': script}
 
-def action_get_backup_config(params, cfg):
+
+def action_run_manual_backup(params, cfg):
+    """Run a one-off manual database backup to specific rclone destinations (synchronous)."""
+    import tempfile as _tempfile
+    import datetime as _dt
+
+    db = (params.get('db') or cfg.get('db_name', '')).strip()
+    if not db:
+        raise ValueError('db is required')
+
+    destinations = params.get('destinations', [])
+    if not destinations:
+        raise ValueError('at least one destination is required')
+
+    rclone_conf = cfg.get('rclone_config', '')
+    base_rclone = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
+    log_path = cfg.get('backup_log', '/var/log/odoo/backup.log')
+    start_dt = _dt.datetime.now()
+
+    def write_log(msg):
+        ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            with open(log_path, 'a') as f:
+                f.write(f'[{ts}] {msg}\n')
+        except Exception:
+            pass
+
+    tmp_dir = _tempfile.mkdtemp(prefix='sc_manual_')
+    try:
+        write_log('[MANUAL] Backup started')
+
+        dump_file = os.path.join(tmp_dir, f'{db}_manual.dump')
+        log.info('[manual_backup] Dumping database %s', db)
+        out, err, rc = _run(['pg_dump', '-Fc', '-d', db, '-f', dump_file], timeout=600)
+        if rc != 0:
+            write_log('Backup FAILED step: dump')
+            raise RuntimeError(f'pg_dump failed (rc={rc}): {err.strip()[:300]}')
+
+        dump_size = os.path.getsize(dump_file)
+        write_log(f'[INFO] Dump size: {_human_size(dump_size)}')
+
+        ts_str = start_dt.strftime('%Y%m%d_%H%M')
+        remote_filename = f'{db}_manual_{ts_str}.dump'
+        dest_results = []
+        any_failed = False
+
+        for dest in destinations:
+            name = dest.get('name', 'unknown')
+            db_path = (dest.get('dbPath') or '').rstrip('/')
+            if not db_path:
+                dest_results.append({'name': name, 'status': 'failed', 'error': 'no dbPath configured'})
+                write_log(f'[DEST_RESULT] name={name} db=fail fs=na')
+                any_failed = True
+                continue
+            remote_path = f'{db_path}/manual/{remote_filename}'
+            log.info('[manual_backup] Uploading to %s', remote_path)
+            _, err, rc = _run(base_rclone + ['copyto', dump_file, remote_path], timeout=300)
+            if rc == 0:
+                dest_results.append({'name': name, 'status': 'ok', 'path': remote_path})
+                write_log(f'[DEST_RESULT] name={name} db=ok fs=na')
+            else:
+                dest_results.append({'name': name, 'status': 'failed', 'error': err.strip()[:200]})
+                write_log(f'[DEST_RESULT] name={name} db=fail fs=na')
+                any_failed = True
+
+        if any_failed:
+            write_log('Backup FAILED step: rclone_db')
+            failed_names = [d['name'] for d in dest_results if d['status'] != 'ok']
+            raise RuntimeError(f'Upload failed for: {", ".join(failed_names)}')
+
+        elapsed = int((_dt.datetime.now() - start_dt).total_seconds())
+        mins, secs = divmod(elapsed, 60)
+        write_log(f'Backup complete total: {mins}m {secs}s')
+
+        return {
+            'status': 'ok',
+            'db': db,
+            'dump_size': dump_size,
+            'dump_size_human': _human_size(dump_size),
+            'destinations': dest_results,
+        }
+    except Exception:
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
     script = cfg['backup_script']
     if not os.path.isfile(script):
         raise FileNotFoundError(f'Script not found: {script}')
@@ -805,6 +891,12 @@ def action_restore_backup(params, cfg):
         dump_size = os.path.getsize(dump_file)
         log.info('[restore] Downloaded %s (%s)', os.path.basename(rclone_path), _human_size(dump_size))
 
+        log.info('[restore] Verifying dump integrity')
+        vf_stdout, vf_stderr, vf_rc = _run(['pg_restore', '--list', dump_file], timeout=60)
+        if vf_rc != 0:
+            raise RuntimeError(f'Dump file is not a valid PostgreSQL archive: {vf_stderr.strip()[:300]}')
+        log.info('[restore] Dump integrity OK (%d objects listed)', len(vf_stdout.strip().splitlines()))
+
         log.info('[restore] Stopping %s', svc)
         _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
 
@@ -825,13 +917,29 @@ def action_restore_backup(params, cfg):
         log.info('[restore] Starting %s', svc)
         _run(['sudo', 'systemctl', 'start', svc], timeout=60)
 
-        log.info('[restore] Complete')
+        log.info('[restore] Validating service status')
+        svc_out, _, svc_rc = _run(['sudo', 'systemctl', 'is-active', svc], timeout=10)
+        svc_active = svc_out.strip() == 'active'
+
+        log.info('[restore] Validating database connectivity')
+        _, _, db_rc = _run(['pg_isready', '-d', db], timeout=10)
+        db_ready = db_rc == 0
+
+        if not svc_active or not db_ready:
+            raise RuntimeError(
+                f'Restore complete but post-restore validation failed — '
+                f'service active: {svc_active}, db ready: {db_ready}'
+            )
+
+        log.info('[restore] Complete — service active, database ready')
         return {
             'status': 'ok',
             'restored_from': rclone_path,
             'db': db,
             'dump_size': dump_size,
             'dump_size_human': _human_size(dump_size),
+            'svc_active': svc_active,
+            'db_ready': db_ready,
         }
     except Exception:
         try:
@@ -1717,7 +1825,8 @@ ACTIONS = {
     'get_logs':           action_get_logs,
     'get_rclone_log':     action_get_rclone_log,
     'get_rclone_remotes': action_get_rclone_remotes,
-    'trigger_backup':     action_trigger_backup,
+    'trigger_backup':         action_trigger_backup,
+    'run_manual_backup':      action_run_manual_backup,
     'get_backup_config':    action_get_backup_config,
     'set_backup_config':    action_set_backup_config,
     'update_backup_script':       action_update_backup_script,
