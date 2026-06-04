@@ -269,6 +269,7 @@ def action_run_manual_backup(params, cfg):
     if not destinations:
         raise ValueError('at least one destination is required')
 
+    include_filestore = params.get('include_filestore', True)
     rclone_conf = cfg.get('rclone_config', '')
     base_rclone = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
     log_path = cfg.get('backup_log', '/var/log/odoo/backup.log')
@@ -334,7 +335,7 @@ def action_run_manual_backup(params, cfg):
                     log.warning('[manual_backup] DB upload failed for %s: %s', name, err.strip()[:200])
 
             # Filestore sync
-            if has_filestore and fs_path:
+            if include_filestore and has_filestore and fs_path:
                 log.info('[manual_backup] Syncing filestore to %s', fs_path)
                 _, err, rc = _run(
                     base_rclone + ['sync', filestore_local, fs_path,
@@ -344,7 +345,7 @@ def action_run_manual_backup(params, cfg):
                 if rc != 0:
                     fs_ok = 'fail'
                     log.warning('[manual_backup] Filestore sync failed for %s: %s', name, err.strip()[:200])
-            elif not fs_path or not has_filestore:
+            elif not include_filestore or not fs_path or not has_filestore:
                 fs_ok = 'na'
 
             write_log(f'[DEST_RESULT] name={name} db={db_ok} fs={fs_ok}')
