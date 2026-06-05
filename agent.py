@@ -1006,8 +1006,10 @@ def action_verify_backup(params, cfg):
 
 def action_restore_backup(params, cfg):
     # Download a specific backup from rclone and restore it to the database.
+    # If dry_run=True: download + verify integrity only, no DB changes.
     import tempfile as _tempfile
     rclone_path = params.get('path', '').strip()
+    dry_run = bool(params.get('dry_run', False))
     if not rclone_path:
         raise ValueError('path is required')
     if not rclone_path.endswith('.dump'):
@@ -1029,7 +1031,7 @@ def action_restore_backup(params, cfg):
     tmp_dir = _tempfile.mkdtemp(prefix='sc_restore_')
     dump_file = os.path.join(tmp_dir, 'restore.dump')
     try:
-        log.info('[restore] Downloading %s', rclone_path)
+        log.info('[restore%s] Downloading %s', ' dry-run' if dry_run else '', rclone_path)
         dl_stdout, dl_stderr, dl_rc = _run(
             base_rclone + ['copyto', rclone_path, dump_file], timeout=300)
         if dl_rc != 0:
@@ -1043,7 +1045,20 @@ def action_restore_backup(params, cfg):
         vf_stdout, vf_stderr, vf_rc = _run(['pg_restore', '--list', dump_file], timeout=60)
         if vf_rc != 0:
             raise RuntimeError(f'Dump file is not a valid PostgreSQL archive: {vf_stderr.strip()[:300]}')
-        log.info('[restore] Dump integrity OK (%d objects listed)', len(vf_stdout.strip().splitlines()))
+        object_count = len([l for l in vf_stdout.strip().splitlines() if l and not l.startswith(';')])
+        log.info('[restore] Dump integrity OK (%d objects listed)', object_count)
+
+        if dry_run:
+            log.info('[restore] Dry run complete — skipping database changes')
+            return {
+                'dry_run': True,
+                'ok': True,
+                'path': rclone_path,
+                'dump_size': dump_size,
+                'dump_size_human': _human_size(dump_size),
+                'object_count': object_count,
+                'message': f'Dump is valid — {object_count} objects, {_human_size(dump_size)}',
+            }
 
         log.info('[restore] Stopping %s', svc)
         _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
