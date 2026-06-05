@@ -30,70 +30,83 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE = os.environ.get('SERVERCHEST_CONFIG', '/etc/serverchest-agent.conf')
 
-# Common Odoo installation layouts across all supported distros:
-# Ubuntu, Debian, RHEL, AlmaLinux, Rocky Linux, CentOS 7+
-_PROBE_HOMES = [
-    '/opt/odoo17', '/opt/odoo16', '/opt/odoo15', '/opt/odoo14',
-    '/opt/odoo', '/home/odoo', '/srv/odoo',
-]
-_PROBE_CONFS = [
-    '/etc/odoo17.conf', '/etc/odoo16.conf', '/etc/odoo15.conf',
-    '/etc/odoo.conf', '/etc/odoo/odoo.conf',
-]
-_PROBE_LOGS = [
-    '/var/log/odoo/odoo17.log', '/var/log/odoo/odoo16.log',
-    '/var/log/odoo/odoo.log', '/var/log/odoo.log',
-]
-
 def _autodetect_paths(s):
     """Fill any missing config values by probing the filesystem at startup.
-    Supports all Odoo versions and distros — no version-specific path is ever
-    hardcoded as a fallback."""
+    Uses glob patterns so it works with any Odoo version (14, 15, 16, 17, 18, 19…)
+    on any supported Linux distro — no version numbers are hardcoded."""
+    import glob
 
-    # 1. odoo_home
+    def _newest_match(pattern):
+        """Return matches sorted so higher version numbers come first."""
+        matches = glob.glob(pattern)
+        # Sort descending so /opt/odoo18 beats /opt/odoo17 beats /opt/odoo
+        matches.sort(key=lambda p: (
+            int(''.join(filter(str.isdigit, os.path.basename(p))) or '0')
+        ), reverse=True)
+        return matches
+
+    # 1. odoo_home — scan /opt/odoo*, /home/odoo*, /srv/odoo*
     home = s.get('odoo_home', '').strip()
     if not home:
-        for h in _PROBE_HOMES:
-            if os.path.isdir(h):
-                home = h
+        for candidate in (
+            _newest_match('/opt/odoo[0-9]*') +
+            ['/opt/odoo', '/home/odoo', '/srv/odoo'] +
+            _newest_match('/home/odoo[0-9]*')
+        ):
+            if os.path.isdir(candidate):
+                home = candidate
                 break
     s['odoo_home'] = home
 
-    # 2. odoo_conf
+    # 2. odoo_conf — /etc/odooXX.conf or /etc/odoo/odoo.conf
     if not s.get('odoo_conf'):
-        for p in _PROBE_CONFS:
+        candidates = (
+            _newest_match('/etc/odoo[0-9]*.conf') +
+            ['/etc/odoo.conf', '/etc/odoo/odoo.conf']
+        )
+        for p in candidates:
             if os.path.isfile(p):
                 s['odoo_conf'] = p
                 break
         else:
             s['odoo_conf'] = ''
 
-    # 3. odoo_src (odoo-bin executable)
+    # 3. odoo_src (odoo-bin) — look inside any odooXX/ subdir of home, then system paths
     if not s.get('odoo_src'):
-        for sub in ('odoo17', 'odoo16', 'odoo15', 'odoo14', 'odoo', 'src'):
-            p = os.path.join(home, sub, 'odoo-bin') if home else ''
-            if p and os.path.isfile(p):
-                s['odoo_src'] = p
-                break
-        else:
-            # System-installed Odoo (apt/deb package)
+        found = ''
+        if home:
+            # Subdirs like odoo18/, odoo17/, odoo/, src/ inside home
+            subdirs = (
+                _newest_match(os.path.join(home, 'odoo[0-9]*')) +
+                [os.path.join(home, d) for d in ('odoo', 'src')]
+            )
+            for d in subdirs:
+                p = os.path.join(d, 'odoo-bin')
+                if os.path.isfile(p):
+                    found = p
+                    break
+        if not found:
             for p in ('/usr/lib/python3/dist-packages/odoo/odoo-bin',
                       '/usr/share/odoo/odoo-bin'):
                 if os.path.isfile(p):
-                    s['odoo_src'] = p
+                    found = p
                     break
-            else:
-                s['odoo_src'] = ''
+        s['odoo_src'] = found
 
-    # 4. odoo_bin (Python interpreter — prefer the venv)
+    # 4. odoo_bin (Python interpreter) — prefer any *-venv inside home
     if not s.get('odoo_bin'):
-        for sub in ('odoo17-venv', 'odoo16-venv', 'odoo15-venv', 'venv', 'odoo-venv'):
-            p = os.path.join(home, sub, 'bin', 'python') if home else ''
-            if p and os.path.isfile(p):
-                s['odoo_bin'] = p
-                break
-        else:
-            s['odoo_bin'] = shutil.which('python3') or '/usr/bin/python3'
+        found = ''
+        if home:
+            venvs = (
+                _newest_match(os.path.join(home, 'odoo[0-9]*-venv')) +
+                [os.path.join(home, d) for d in ('venv', 'odoo-venv')]
+            )
+            for d in venvs:
+                p = os.path.join(d, 'bin', 'python')
+                if os.path.isfile(p):
+                    found = p
+                    break
+        s['odoo_bin'] = found or shutil.which('python3') or '/usr/bin/python3'
 
     # 5. backup_script
     if not s.get('backup_script'):
@@ -110,9 +123,18 @@ def _autodetect_paths(s):
         p = os.path.join(home, 'rclone.conf') if home else ''
         s['rclone_config'] = p if (p and os.path.isfile(p)) else ''
 
-    # 7. odoo_log
+    # 7. odoo_log — /var/log/odoo/odooXX.log, newest version first
     if not s.get('odoo_log'):
-        for p in _PROBE_LOGS:
+        candidates = (
+            _newest_match('/var/log/odoo/odoo[0-9]*.log') +
+            ['/var/log/odoo/odoo.log', '/var/log/odoo.log']
+        )
+        for p in candidates:
+            if os.path.isfile(p):
+                s['odoo_log'] = p
+                break
+        else:
+            s['odoo_log'] = '/var/log/odoo/odoo.log'
             if os.path.isfile(p):
                 s['odoo_log'] = p
                 break
@@ -123,27 +145,27 @@ def _autodetect_paths(s):
     if not s.get('backup_log'):
         s['backup_log'] = '/var/log/odoo/backup.log'
 
-    # 9. service_name — probe running systemd services
+    # 9. service_name — find any loaded odoo*.service via systemctl,
+    #    prefer higher version numbers (handles odoo14 through odoo99+)
     if not s.get('service_name'):
-        for svc in ('odoo17', 'odoo16', 'odoo15', 'odoo14', 'odoo'):
-            r = subprocess.run(['systemctl', 'is-active', '--quiet', svc],
-                               capture_output=True)
-            if r.returncode == 0:
-                s['service_name'] = svc
-                break
+        r = subprocess.run(
+            ['systemctl', 'list-units', '--type=service', '--state=loaded',
+             '--plain', '--no-legend'], capture_output=True, text=True)
+        odoo_svcs = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            name = parts[0] if parts else ''
+            if name.startswith('odoo') and name.endswith('.service'):
+                odoo_svcs.append(name[:-len('.service')])
+        if odoo_svcs:
+            # Sort descending by embedded version number so odoo18 > odoo17 > odoo
+            odoo_svcs.sort(
+                key=lambda n: int(''.join(filter(str.isdigit, n)) or '0'),
+                reverse=True,
+            )
+            s['service_name'] = odoo_svcs[0]
         else:
-            # None active — find any loaded odoo*.service
-            r = subprocess.run(
-                ['systemctl', 'list-units', '--type=service', '--state=loaded',
-                 '--plain', '--no-legend'], capture_output=True, text=True)
-            for line in r.stdout.splitlines():
-                parts = line.split()
-                name = parts[0] if parts else ''
-                if name.startswith('odoo') and name.endswith('.service'):
-                    s['service_name'] = name[:-len('.service')]
-                    break
-            else:
-                s['service_name'] = 'odoo'
+            s['service_name'] = 'odoo'
 
     # 10. odoo_user — most reliable sources first:
     #     a) systemd service User= property (authoritative)
