@@ -145,17 +145,34 @@ def _autodetect_paths(s):
             else:
                 s['service_name'] = 'odoo'
 
-    # 10. odoo_user — infer from file ownership
+    # 10. odoo_user — most reliable sources first:
+    #     a) systemd service User= property (authoritative)
+    #     b) ownership of odoo_src (odoo-bin is owned by the Odoo user)
+    #     c) ownership of odoo_home directory
+    #     d) fall back to 'odoo'
     if not s.get('odoo_user'):
         import pwd as _pwd
-        for target in (s.get('odoo_conf', ''), s.get('odoo_src', '')):
-            if target and os.path.exists(target):
-                try:
-                    s['odoo_user'] = _pwd.getpwuid(os.stat(target).st_uid).pw_name
+        svc = s.get('service_name', '')
+        # a) systemd
+        if svc:
+            r = subprocess.run(['systemctl', 'show', svc, '--property=User'],
+                               capture_output=True, text=True)
+            for line in r.stdout.splitlines():
+                if line.startswith('User=') and line[5:].strip():
+                    s['odoo_user'] = line[5:].strip()
                     break
-                except Exception:
-                    pass
-        else:
+        # b) odoo_src ownership (odoo-bin, NOT odoo.conf which is often root-owned)
+        if not s.get('odoo_user'):
+            for target in (s.get('odoo_src', ''), s.get('odoo_home', '')):
+                if target and os.path.exists(target):
+                    try:
+                        user = _pwd.getpwuid(os.stat(target).st_uid).pw_name
+                        if user != 'root':
+                            s['odoo_user'] = user
+                            break
+                    except Exception:
+                        pass
+        if not s.get('odoo_user'):
             s['odoo_user'] = 'odoo'
 
     return s
