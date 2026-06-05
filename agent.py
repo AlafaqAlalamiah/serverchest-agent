@@ -135,11 +135,6 @@ def _autodetect_paths(s):
                 break
         else:
             s['odoo_log'] = '/var/log/odoo/odoo.log'
-            if os.path.isfile(p):
-                s['odoo_log'] = p
-                break
-        else:
-            s['odoo_log'] = '/var/log/odoo/odoo.log'
 
     # 8. backup_log
     if not s.get('backup_log'):
