@@ -30,25 +30,157 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE = os.environ.get('SERVERCHEST_CONFIG', '/etc/serverchest-agent.conf')
 
+# Common Odoo installation layouts across all supported distros:
+# Ubuntu, Debian, RHEL, AlmaLinux, Rocky Linux, CentOS 7+
+_PROBE_HOMES = [
+    '/opt/odoo17', '/opt/odoo16', '/opt/odoo15', '/opt/odoo14',
+    '/opt/odoo', '/home/odoo', '/srv/odoo',
+]
+_PROBE_CONFS = [
+    '/etc/odoo17.conf', '/etc/odoo16.conf', '/etc/odoo15.conf',
+    '/etc/odoo.conf', '/etc/odoo/odoo.conf',
+]
+_PROBE_LOGS = [
+    '/var/log/odoo/odoo17.log', '/var/log/odoo/odoo16.log',
+    '/var/log/odoo/odoo.log', '/var/log/odoo.log',
+]
+
+def _autodetect_paths(s):
+    """Fill any missing config values by probing the filesystem at startup.
+    Supports all Odoo versions and distros — no version-specific path is ever
+    hardcoded as a fallback."""
+
+    # 1. odoo_home
+    home = s.get('odoo_home', '').strip()
+    if not home:
+        for h in _PROBE_HOMES:
+            if os.path.isdir(h):
+                home = h
+                break
+    s['odoo_home'] = home
+
+    # 2. odoo_conf
+    if not s.get('odoo_conf'):
+        for p in _PROBE_CONFS:
+            if os.path.isfile(p):
+                s['odoo_conf'] = p
+                break
+        else:
+            s['odoo_conf'] = ''
+
+    # 3. odoo_src (odoo-bin executable)
+    if not s.get('odoo_src'):
+        for sub in ('odoo17', 'odoo16', 'odoo15', 'odoo14', 'odoo', 'src'):
+            p = os.path.join(home, sub, 'odoo-bin') if home else ''
+            if p and os.path.isfile(p):
+                s['odoo_src'] = p
+                break
+        else:
+            # System-installed Odoo (apt/deb package)
+            for p in ('/usr/lib/python3/dist-packages/odoo/odoo-bin',
+                      '/usr/share/odoo/odoo-bin'):
+                if os.path.isfile(p):
+                    s['odoo_src'] = p
+                    break
+            else:
+                s['odoo_src'] = ''
+
+    # 4. odoo_bin (Python interpreter — prefer the venv)
+    if not s.get('odoo_bin'):
+        for sub in ('odoo17-venv', 'odoo16-venv', 'odoo15-venv', 'venv', 'odoo-venv'):
+            p = os.path.join(home, sub, 'bin', 'python') if home else ''
+            if p and os.path.isfile(p):
+                s['odoo_bin'] = p
+                break
+        else:
+            s['odoo_bin'] = shutil.which('python3') or '/usr/bin/python3'
+
+    # 5. backup_script
+    if not s.get('backup_script'):
+        for name in ('odoo_backup.sh', 'backup_to_onedrive.sh'):
+            p = os.path.join(home, name) if home else ''
+            if p and os.path.isfile(p):
+                s['backup_script'] = p
+                break
+        else:
+            s['backup_script'] = os.path.join(home, 'odoo_backup.sh') if home else ''
+
+    # 6. rclone_config
+    if not s.get('rclone_config'):
+        p = os.path.join(home, 'rclone.conf') if home else ''
+        s['rclone_config'] = p if (p and os.path.isfile(p)) else ''
+
+    # 7. odoo_log
+    if not s.get('odoo_log'):
+        for p in _PROBE_LOGS:
+            if os.path.isfile(p):
+                s['odoo_log'] = p
+                break
+        else:
+            s['odoo_log'] = '/var/log/odoo/odoo.log'
+
+    # 8. backup_log
+    if not s.get('backup_log'):
+        s['backup_log'] = '/var/log/odoo/backup.log'
+
+    # 9. service_name — probe running systemd services
+    if not s.get('service_name'):
+        for svc in ('odoo17', 'odoo16', 'odoo15', 'odoo14', 'odoo'):
+            r = subprocess.run(['systemctl', 'is-active', '--quiet', svc],
+                               capture_output=True)
+            if r.returncode == 0:
+                s['service_name'] = svc
+                break
+        else:
+            # None active — find any loaded odoo*.service
+            r = subprocess.run(
+                ['systemctl', 'list-units', '--type=service', '--state=loaded',
+                 '--plain', '--no-legend'], capture_output=True, text=True)
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                name = parts[0] if parts else ''
+                if name.startswith('odoo') and name.endswith('.service'):
+                    s['service_name'] = name[:-len('.service')]
+                    break
+            else:
+                s['service_name'] = 'odoo'
+
+    # 10. odoo_user — infer from file ownership
+    if not s.get('odoo_user'):
+        import pwd as _pwd
+        for target in (s.get('odoo_conf', ''), s.get('odoo_src', '')):
+            if target and os.path.exists(target):
+                try:
+                    s['odoo_user'] = _pwd.getpwuid(os.stat(target).st_uid).pw_name
+                    break
+                except Exception:
+                    pass
+        else:
+            s['odoo_user'] = 'odoo'
+
+    return s
+
+
 def load_config():
     cfg = configparser.ConfigParser()
     cfg.read(CONFIG_FILE)
-    s = cfg['agent'] if 'agent' in cfg else {}
+    s = {k: v.strip() for k, v in cfg['agent'].items()} if 'agent' in cfg else {}
+    _autodetect_paths(s)
     return {
-        'relay_url':     s.get('relay_url',     'ws://localhost:3003'),
-        'api_key':       s.get('api_key',        ''),
-        'backup_script': s.get('backup_script',  '/opt/odoo17/odoo_backup.sh'),
-        'backup_log':    s.get('backup_log',     '/var/log/odoo/backup.log'),
-        'odoo_log':      s.get('odoo_log',       '/var/log/odoo/odoo17.log'),
-        'rclone_config': s.get('rclone_config',  '/opt/odoo17/rclone.conf'),
-        'odoo_conf':     s.get('odoo_conf',      '/etc/odoo17.conf'),
-        'odoo_bin':      s.get('odoo_bin',       '/opt/odoo17/odoo17-venv/bin/python'),
-        'odoo_src':      s.get('odoo_src',       '/opt/odoo17/odoo17/odoo-bin'),
-        'db_name':       s.get('db_name',        ''),
-        'service_name':  s.get('service_name',   'odoo17'),
-        'odoo_user':     s.get('odoo_user',      'odoo17'),
-        'odoo_home':     s.get('odoo_home',      '/opt/odoo17'),
-        'backup_remote': s.get('backup_remote',   ''),
+        'relay_url':     s.get('relay_url',    'ws://localhost:3003'),
+        'api_key':       s.get('api_key',       ''),
+        'backup_script': s.get('backup_script', ''),
+        'backup_log':    s.get('backup_log',    ''),
+        'odoo_log':      s.get('odoo_log',      ''),
+        'rclone_config': s.get('rclone_config', ''),
+        'odoo_conf':     s.get('odoo_conf',     ''),
+        'odoo_bin':      s.get('odoo_bin',      ''),
+        'odoo_src':      s.get('odoo_src',      ''),
+        'db_name':       s.get('db_name',       ''),
+        'service_name':  s.get('service_name',  ''),
+        'odoo_user':     s.get('odoo_user',     ''),
+        'odoo_home':     s.get('odoo_home',     ''),
+        'backup_remote': s.get('backup_remote',  ''),
     }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -70,6 +202,76 @@ def _human_size(n):
 def _run(cmd, timeout=30, input=None):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
     return r.stdout, r.stderr, r.returncode
+
+def _detect_os():
+    """Detect OS/distro from /etc/os-release. Works on all modern Linux distros
+    (Ubuntu, Debian, RHEL, AlmaLinux, Rocky Linux, CentOS 7+)."""
+    info = {}
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    info[k] = v.strip('"\'')
+    except Exception:
+        pass
+    return {
+        'os_id':      info.get('ID', 'linux'),
+        'os_version': info.get('VERSION_ID', ''),
+        'os_pretty':  info.get('PRETTY_NAME', 'Linux'),
+    }
+
+def _detect_odoo_version(cfg):
+    """Detect installed Odoo version from release.py.
+    Supports all install layouts:
+      - Source install under /opt/odooXX/odooXX/odoo-bin  (most common)
+      - System package on Debian/Ubuntu (python3-odoo)
+      - Custom/non-standard paths via odoo_home walk
+    """
+    odoo_src  = cfg.get('odoo_src', '')
+    odoo_home = cfg.get('odoo_home', '')
+
+    def _parse(path):
+        try:
+            with open(path) as f:
+                txt = f.read()
+            m = re.search(r"^version\s*=\s*'([^']+)'", txt, re.MULTILINE)
+            if m and m.group(1) not in ('.', ''):
+                return m.group(1)
+            m2 = re.search(r'version_info\s*=\s*\((\d+),\s*(\d+)', txt)
+            if m2:
+                return f"{m2.group(1)}.{m2.group(2)}"
+        except Exception:
+            pass
+        return None
+
+    # 1. Alongside odoo_src: /opt/odoo17/odoo17/odoo-bin → /opt/odoo17/odoo17/odoo/release.py
+    if odoo_src:
+        candidate = os.path.join(os.path.dirname(odoo_src), 'odoo', 'release.py')
+        v = _parse(candidate)
+        if v:
+            return v
+
+    # 2. Walk odoo_home (handles non-standard source layouts)
+    if odoo_home and os.path.isdir(odoo_home):
+        for root, dirs, files in os.walk(odoo_home):
+            if 'release.py' in files and os.path.basename(root) == 'odoo':
+                v = _parse(os.path.join(root, 'release.py'))
+                if v:
+                    return v
+
+    # 3. System-installed Odoo (Debian/Ubuntu apt package or pip into system Python)
+    for path in (
+        '/usr/lib/python3/dist-packages/odoo/release.py',
+        '/usr/share/odoo/release.py',
+        '/usr/local/lib/python3/dist-packages/odoo/release.py',
+    ):
+        v = _parse(path)
+        if v:
+            return v
+
+    return None
 
 # ── System metrics ring buffer ────────────────────────────────────────────────
 # Keeps the last 6 hours of 1-minute samples (360 points) in memory.
@@ -131,17 +333,22 @@ def _proc_net():
 
 def action_ping(params, cfg):
     import platform
+    odoo_ver = _detect_odoo_version(cfg)
+    os_info  = _detect_os()
     return {
         'status': 'ok',
         'hostname': platform.node(),
         'agent_version': '2.0.0',
         'db': cfg.get('db_name', ''),
-        'odoo_version': 'Odoo 17',
+        'odoo_version': f'Odoo {odoo_ver}' if odoo_ver else 'Odoo (unknown)',
+        'os_id':        os_info['os_id'],
+        'os_version':   os_info['os_version'],
+        'os_pretty':    os_info['os_pretty'],
     }
 
 def action_get_disk_usage(params, cfg):
     result = {}
-    odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+    odoo_home = cfg.get('odoo_home', '')
     for label, path in [('root', '/'), ('odoo', odoo_home)]:
         if os.path.exists(path):
             u = shutil.disk_usage(path)
@@ -244,7 +451,7 @@ def action_get_backup_config(params, cfg):
     version_m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
     config['script_version'] = version_m.group(1).strip() if version_m else None
 
-    stdout, _, _ = _run(['crontab', '-u', cfg.get('odoo_user', 'odoo17'), '-l'])
+    stdout, _, _ = _run(['crontab', '-u', cfg.get('odoo_user', ''), '-l'])
     cron_schedule = '0 2 * * *'
     for line in stdout.splitlines():
         if script in line and not line.startswith('#'):
@@ -273,7 +480,7 @@ def action_run_manual_backup(params, cfg):
     rclone_conf = cfg.get('rclone_config', '')
     base_rclone = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
     log_path = cfg.get('backup_log', '/var/log/odoo/backup.log')
-    odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+    odoo_home = cfg.get('odoo_home', '')
     filestore_local = os.path.join(odoo_home, '.local', 'share', 'Odoo', 'filestore', db)
     start_dt = _dt.datetime.now()
 
@@ -410,7 +617,7 @@ def action_set_backup_config(params, cfg):
     version_m = re.search(r'^SCRIPT_VERSION=["\']?([^"\'\'\n]+)["\']?', content, re.MULTILINE)
     config['script_version'] = version_m.group(1).strip() if version_m else None
 
-    stdout, _, _ = _run(['crontab', '-u', cfg.get('odoo_user', 'odoo17'), '-l'])
+    stdout, _, _ = _run(['crontab', '-u', cfg.get('odoo_user', ''), '-l'])
     cron_schedule = '0 2 * * *'
     for line in stdout.splitlines():
         if script in line and not line.startswith('#'):
@@ -483,7 +690,7 @@ def action_set_backup_config(params, cfg):
 
     # Update cron
     if 'cron_schedule' in params:
-        odoo_user = cfg.get('odoo_user', 'odoo17')
+        odoo_user = cfg.get('odoo_user', '')
         stdout, _, _ = _run(['crontab', '-u', odoo_user, '-l'])
         lines = [l for l in stdout.splitlines() if script not in l]
         lines.append(f"{params['cron_schedule']} {script}")
@@ -743,7 +950,7 @@ def action_read_odoo_conf(params, cfg):
 def action_write_odoo_conf(params, cfg):
     """Update the Odoo config file. Pass 'options' dict for selective key updates,
     or 'raw' string for a full text replacement. A .bak backup is always created first."""
-    conf_path = cfg.get('odoo_conf', '/etc/odoo17.conf')
+    conf_path = cfg.get('odoo_conf', '')
     if not os.path.isfile(conf_path):
         raise FileNotFoundError(f'Config not found: {conf_path}')
 
@@ -845,7 +1052,7 @@ def action_list_backups(params, cfg):
 
     # Try backup_destinations.json first (mirrors what the backup script does)
     backup_remote = None
-    dest_file = _get_var('DESTINATIONS_FILE') or '/opt/odoo17/backup_destinations.json'
+    dest_file = _get_var('DESTINATIONS_FILE') or os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
     if os.path.isfile(dest_file):
         try:
             with open(dest_file) as f:
@@ -927,7 +1134,7 @@ def action_verify_backup(params, cfg):
     dest_fs_path = None
     if not db_paths_param:
         # Try backup_destinations.json — path from script var or default
-        dest_file = _get_var('DESTINATIONS_FILE') or '/opt/odoo17/backup_destinations.json'
+        dest_file = _get_var('DESTINATIONS_FILE') or os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
         if os.path.isfile(dest_file):
             try:
                 with open(dest_file) as f:
@@ -1084,7 +1291,7 @@ def action_restore_backup(params, cfg):
         fs_remote = None
         fs_restored = False
         fs_error = None
-        dest_file = '/opt/odoo17/backup_destinations.json'
+        dest_file = os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
         if os.path.isfile(dest_file):
             try:
                 with open(dest_file) as f:
@@ -1093,7 +1300,7 @@ def action_restore_backup(params, cfg):
                     fs_remote = dests[0]['fs_path'].rstrip('/')
             except Exception:
                 pass
-        odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+        odoo_home = cfg.get('odoo_home', '')
         filestore_local = os.path.join(odoo_home, '.local', 'share', 'Odoo', 'filestore', db)
         if fs_remote and shutil.which('rclone'):
             log.info('[restore] Syncing filestore from %s → %s', fs_remote, filestore_local)
@@ -1312,7 +1519,7 @@ def action_sync_destinations(params, cfg):
     """Write backup_destinations.json from the destinations array. params: destinations list"""
     import json as _json
     destinations = params.get('destinations', [])
-    dest_file = os.path.join(cfg.get('odoo_home', '/opt/odoo17'), 'backup_destinations.json')
+    dest_file = os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
     with open(dest_file, 'w') as f:
         _json.dump(destinations, f, indent=2)
     return {'ok': True, 'count': len(destinations), 'file': dest_file}
@@ -1320,7 +1527,7 @@ def action_sync_destinations(params, cfg):
 
 def action_list_databases(params, cfg):
     """List Odoo PostgreSQL databases (owned by the configured odoo_user role)."""
-    odoo_user = cfg.get('odoo_user', 'odoo17')
+    odoo_user = cfg.get('odoo_user', '')
     query = (
         "SELECT datname FROM pg_database "
         "WHERE datistemplate = false "
@@ -1547,7 +1754,7 @@ def action_test_webhook(params, cfg):
 # ── Maintenance mode ──────────────────────────────────────────────────────────
 
 def _maintenance_flag(cfg):
-    return os.path.join(cfg.get('odoo_home', '/opt/odoo17'), 'maintenance.flag')
+    return os.path.join(cfg.get('odoo_home', ''), 'maintenance.flag')
 
 def action_get_maintenance_status(params, cfg):
     """Return current maintenance mode status."""
@@ -1569,7 +1776,7 @@ def action_enable_maintenance(params, cfg):
     since = datetime.datetime.utcnow().isoformat() + 'Z'
     with open(_maintenance_flag(cfg), 'w') as f:
         _json.dump({'since': since, 'message': message}, f)
-    svc = cfg.get('service_name', 'odoo17')
+    svc = cfg.get('service_name', '')
     _, _, rc = _run(['systemctl', 'stop', svc], timeout=30)
     return {'active': True, 'since': since, 'message': message, 'service_stopped': rc == 0}
 
@@ -1578,7 +1785,7 @@ def action_disable_maintenance(params, cfg):
     flag = _maintenance_flag(cfg)
     if os.path.exists(flag):
         os.remove(flag)
-    svc = cfg.get('service_name', 'odoo17')
+    svc = cfg.get('service_name', '')
     _, _, rc = _run(['systemctl', 'start', svc], timeout=30)
     return {'active': False, 'service_started': rc == 0}
 
@@ -1587,38 +1794,12 @@ def action_disable_maintenance(params, cfg):
 
 def action_get_odoo_info(params, cfg):
     result = {}
-    odoo_home = cfg.get('odoo_home', '/opt/odoo17')
-    odoo_conf = cfg.get('odoo_conf', '/etc/odoo17.conf')
-    svc_name  = cfg.get('service_name', 'odoo17')
+    odoo_home = cfg.get('odoo_home', '')
+    odoo_conf = cfg.get('odoo_conf', '')
+    svc_name  = cfg.get('service_name', '')
 
-    # 1. Odoo version — look for release.py under odoo_src sibling or odoo_home
-    odoo_src = cfg.get('odoo_src', '')
-    # odoo_src is typically /opt/odoo17/odoo17/odoo-bin; release.py is at .../odoo/release.py
-    release_path = ''
-    if odoo_src:
-        src_dir = os.path.dirname(odoo_src)  # /opt/odoo17/odoo17
-        candidate = os.path.join(src_dir, 'odoo', 'release.py')
-        if os.path.isfile(candidate):
-            release_path = candidate
-    if not release_path:
-        # Fallback: scan odoo_home for release.py
-        for root, dirs, files in os.walk(odoo_home):
-            if 'release.py' in files and 'odoo' in os.path.basename(root):
-                release_path = os.path.join(root, 'release.py')
-                break
-    if release_path and os.path.isfile(release_path):
-        with open(release_path) as f:
-            rc_txt = f.read()
-        # Try literal string assignment: version = '17.0'
-        m = re.search(r"^version\s*=\s*'([^']+)'", rc_txt, re.MULTILINE)
-        if m and m.group(1) not in ('.', ''):
-            result['version'] = m.group(1)
-        else:
-            # Fall back to version_info tuple: version_info = (17, 0, 0, ...)
-            m2 = re.search(r'version_info\s*=\s*\((\d+),\s*(\d+)', rc_txt)
-            result['version'] = f"{m2.group(1)}.{m2.group(2)}" if m2 else None
-    else:
-        result['version'] = None
+    # 1. Odoo version — delegated to shared helper (supports all install layouts)
+    result['version'] = _detect_odoo_version(cfg)
 
     # 2. Service status
     out, _, _ = _run(['systemctl', 'show', svc_name,
@@ -1643,7 +1824,7 @@ def action_get_odoo_info(params, cfg):
     custom_paths = all_paths[1:] if len(all_paths) > 1 else []
 
     # 3a. List all Odoo-owned databases from PostgreSQL
-    odoo_user = cfg.get('odoo_user', 'odoo17')
+    odoo_user = cfg.get('odoo_user', '')
     db_list_sql = (
         "SELECT datname FROM pg_database d "
         "JOIN pg_roles r ON d.datdba = r.oid "
@@ -1691,7 +1872,7 @@ def action_get_odoo_info(params, cfg):
         query = ("SELECT name, latest_version, author "
                  "FROM ir_module_module WHERE state='installed' ORDER BY name;")
         # Try sudo psql first, fall back to plain psql (matches agent run context)
-        psql_cmd_base = ['sudo', '-u', cfg.get('odoo_user', 'odoo17'), 'psql']
+        psql_cmd_base = ['sudo', '-u', cfg.get('odoo_user', ''), 'psql']
         out, _, rc = _run(psql_cmd_base + ['-d', db_name, '-A', '-F', '\t', '-t', '-c', query], timeout=30)
         if rc != 0:
             out, _, rc = _run(['psql', '-d', db_name, '-A', '-F', '\t', '-t', '-c', query], timeout=30)
@@ -1909,8 +2090,8 @@ async def _metrics_sampler_loop():
 
 def action_get_system_paths(params, cfg):
     """Return suggested paths for the system backup wizard."""
-    odoo_home  = cfg.get('odoo_home', '/opt/odoo17')
-    odoo_conf  = cfg.get('odoo_conf', '/etc/odoo17.conf')
+    odoo_home  = cfg.get('odoo_home', '')
+    odoo_conf  = cfg.get('odoo_conf', '')
 
     addons_paths = []
     try:
