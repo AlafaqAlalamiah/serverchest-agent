@@ -829,18 +829,35 @@ def action_dump_database(params, cfg):
 
 def action_list_backups(params, cfg):
     # List available backup files from rclone remote, grouped by tier.
+    # Reads from backup_destinations.json (same source as the backup script).
     if not shutil.which('rclone'):
         raise RuntimeError('rclone not installed')
 
-    backup_remote = cfg.get('backup_remote', '').rstrip('/')
+    script = cfg.get('backup_script', '')
+    script_content = ''
+    if os.path.isfile(script):
+        with open(script) as fh:
+            script_content = fh.read()
+
+    def _get_var(var):
+        m = re.search(rf'{var}=["\']?([^"\'\n ]+)', script_content, re.MULTILINE)
+        return m.group(1).strip().rstrip('/') if m else ''
+
+    # Try backup_destinations.json first (mirrors what the backup script does)
+    backup_remote = None
+    dest_file = _get_var('DESTINATIONS_FILE') or '/opt/odoo17/backup_destinations.json'
+    if os.path.isfile(dest_file):
+        try:
+            with open(dest_file) as f:
+                dests = json.load(f)
+            if dests and dests[0].get('db_path'):
+                backup_remote = dests[0]['db_path'].rstrip('/')
+        except Exception:
+            pass
+
+    # Legacy fallback: config or backup script variable
     if not backup_remote:
-        script = cfg.get('backup_script', '')
-        if os.path.isfile(script):
-            with open(script) as fh:
-                content = fh.read()
-            m = re.search(r'BACKUP_DB_REMOTE=["\']?([^"\'\n ]+)', content, re.MULTILINE)
-            if m:
-                backup_remote = m.group(1).strip().rstrip('/')
+        backup_remote = cfg.get('backup_remote', '').rstrip('/') or _get_var('BACKUP_DB_REMOTE')
     if not backup_remote:
         raise ValueError('backup_remote not configured')
 
@@ -848,7 +865,7 @@ def action_list_backups(params, cfg):
     base_cmd = ['rclone', '--config', rclone_conf, 'lsjson'] if rclone_conf else ['rclone', 'lsjson']
 
     backups = {}
-    for tier in ('daily', 'weekly', 'monthly'):
+    for tier in ('daily', 'weekly', 'monthly', 'manual'):
         remote_path = f'{backup_remote}/{tier}/'
         stdout, stderr, rc = _run(base_cmd + [remote_path], timeout=60)
         tier_files = []
