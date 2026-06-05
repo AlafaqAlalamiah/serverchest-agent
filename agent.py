@@ -875,8 +875,9 @@ def action_list_backups(params, cfg):
 
 def action_verify_backup(params, cfg):
     """Verify a backup by date: checks DB dump exists in cloud and filestore sync is non-empty.
-    Reads remote paths from the backup script — no hardcoded remote names.
-    For manual backups, db_paths param (list of dbPath strings) overrides the script-based db_remote.
+    Reads destinations from backup_destinations.json (same source as the backup script).
+    Falls back to script BACKUP_DB_REMOTE variable for legacy single-destination setups.
+    For manual backups, db_paths param can override.
     """
     date_str = params.get('date', '').strip()
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
@@ -895,32 +896,61 @@ def action_verify_backup(params, cfg):
         m = re.search(rf'{var}=["\'\']?([^"\'\' \n]+)', script_content, re.MULTILINE)
         return m.group(1).strip().rstrip('/') if m else ''
 
-    # db_paths param: explicit paths passed for manual backup verification
-    db_paths_param = [p.strip().rstrip('/') for p in params.get('db_paths', []) if p.strip()]
-
-    # Resolve DB remote (prefer explicit db_paths, then agent config, then script var)
-    db_remote = cfg.get('backup_remote', '').rstrip('/') or _get_var('BACKUP_DB_REMOTE')
-    if not db_remote and not db_paths_param:
-        raise ValueError('backup_remote / BACKUP_DB_REMOTE not configured')
-
-    # Resolve filestore remote from script var
-    fs_remote = _get_var('BACKUP_FILESTORE_REMOTE')
-
     rclone_conf = cfg.get('rclone_config', '')
     base_cmd = ['rclone', '--config', rclone_conf, 'lsjson'] if rclone_conf else ['rclone', 'lsjson']
 
+    # --- Resolve destination paths ---
+    # Priority: 1) explicit db_paths param (manual backup from UI)
+    #           2) backup_destinations.json (same file the backup script reads)
+    #           3) legacy BACKUP_DB_REMOTE from script
+
+    db_paths_param = [p.strip().rstrip('/') for p in params.get('db_paths', []) if p.strip()]
+
+    dest_db_paths = []
+    dest_fs_path = None
+    if not db_paths_param:
+        # Try backup_destinations.json — path from script var or default
+        dest_file = _get_var('DESTINATIONS_FILE') or '/opt/odoo17/backup_destinations.json'
+        if os.path.isfile(dest_file):
+            try:
+                with open(dest_file) as f:
+                    dests = json.load(f)
+                dest_db_paths = [d['db_path'].rstrip('/') for d in dests if d.get('db_path')]
+                for d in dests:
+                    if d.get('fs_path'):
+                        dest_fs_path = d['fs_path']
+                        break
+            except Exception:
+                pass
+
+    # Determine which db paths to scan
+    if db_paths_param:
+        db_scan_paths = db_paths_param
+    elif dest_db_paths:
+        db_scan_paths = dest_db_paths
+    else:
+        # Legacy fallback: single BACKUP_DB_REMOTE from script
+        legacy = cfg.get('backup_remote', '').rstrip('/') or _get_var('BACKUP_DB_REMOTE')
+        if not legacy:
+            raise ValueError('No destinations configured and backup_remote / BACKUP_DB_REMOTE not set')
+        db_scan_paths = [legacy]
+
+    # Filestore: prefer destinations.json, fall back to script var
+    fs_remote = dest_fs_path or _get_var('BACKUP_FILESTORE_REMOTE')
+
     # --- DB dump check ---
-    # Filenames use compact date format: db_daily_20260524_0200.dump
     date_compact = date_str.replace('-', '')
     db_ok = False
     db_path = None
     db_size = 0
     db_size_human = ''
 
-    if db_paths_param:
-        # Manual backup: search each destination's dbPath/manual/ for a dump with this date
-        for base_path in db_paths_param:
-            stdout, _, rc = _run(base_cmd + [f'{base_path}/manual/'], timeout=30)
+    # For manual backups (db_paths_param provided) only check manual/; otherwise check all tiers
+    tiers = ('manual',) if db_paths_param else ('daily', 'weekly', 'monthly', 'manual')
+
+    for base_path in db_scan_paths:
+        for tier in tiers:
+            stdout, _, rc = _run(base_cmd + [f'{base_path}/{tier}/'], timeout=30)
             if rc != 0 or not stdout.strip():
                 continue
             try:
@@ -930,37 +960,20 @@ def action_verify_backup(params, cfg):
                         db_ok = entry.get('Size', 0) > 0
                         db_size = entry.get('Size', 0)
                         db_size_human = _human_size(db_size)
-                        db_path = f'{base_path}/manual/{name}'
+                        db_path = f'{base_path}/{tier}/{name}'
                         break
             except (json.JSONDecodeError, KeyError):
                 pass
             if db_path:
                 break
-    else:
-        # Scheduled backup: check db_remote/daily/weekly/monthly/manual/
-        for tier in ('daily', 'weekly', 'monthly', 'manual'):
-            stdout, _, rc = _run(base_cmd + [f'{db_remote}/{tier}/'], timeout=30)
-            if rc != 0 or not stdout.strip():
-                continue
-            try:
-                for entry in json.loads(stdout):
-                    name = entry.get('Name', '')
-                    if date_compact in name and name.endswith('.dump'):
-                        db_ok = entry.get('Size', 0) > 0
-                        db_size = entry.get('Size', 0)
-                        db_size_human = _human_size(db_size)
-                        db_path = f'{db_remote}/{tier}/{name}'
-                        break
-            except (json.JSONDecodeError, KeyError):
-                pass
-            if db_path:
-                break
+        if db_path:
+            break
 
     # --- Filestore check ---
     fs_ok = False
     fs_files = 0
     if fs_remote:
-        stdout, _, rc = _run(base_cmd + ['--max-depth', '1', fs_remote + '/'], timeout=30)
+        stdout, _, rc = _run(base_cmd + ['--max-depth', '1', fs_remote.rstrip('/') + '/'], timeout=30)
         if rc == 0 and stdout.strip():
             try:
                 entries = json.loads(stdout)
