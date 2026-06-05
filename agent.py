@@ -1061,7 +1061,9 @@ def action_restore_backup(params, cfg):
             }
 
         log.info('[restore] Stopping %s', svc)
-        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        stop_out, stop_err, stop_rc = _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        if stop_rc != 0:
+            log.warning('[restore] Could not stop %s (rc=%d): %s — continuing anyway', svc, stop_rc, stop_err.strip()[:200])
 
         _run(['psql', '-d', 'postgres', '-c',
               f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -1109,10 +1111,12 @@ def action_restore_backup(params, cfg):
             log.info('[restore] No filestore remote configured — skipping filestore restore')
 
         log.info('[restore] Starting %s', svc)
-        _run(['sudo', 'systemctl', 'start', svc], timeout=60)
+        start_out, start_err, start_rc = _run(['sudo', 'systemctl', 'start', svc], timeout=60)
+        if start_rc != 0:
+            log.warning('[restore] Could not start %s (rc=%d): %s', svc, start_rc, start_err.strip()[:200])
 
         log.info('[restore] Validating service status')
-        svc_out, _, svc_rc = _run(['sudo', 'systemctl', 'is-active', svc], timeout=10)
+        svc_out, _, _ = _run(['systemctl', 'is-active', svc], timeout=10)  # is-active doesn't need root
         svc_active = svc_out.strip() == 'active'
 
         log.info('[restore] Validating database connectivity')

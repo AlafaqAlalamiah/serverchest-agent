@@ -193,10 +193,16 @@ Environment=SERVERCHEST_CONFIG=/etc/serverchest-agent.conf
 WantedBy=multi-user.target
 EOF
 
-# Allow the agent user to restart only its own service without a password.
-# This lets update_agent reload itself via sudo systemctl restart.
+# Allow the agent user to stop/start/restart services without a password.
+# Needed for: update_agent (restart serverchest-agent), restore (stop/start app service).
 SUDOERS_FILE="/etc/sudoers.d/99-serverchest-agent"
-echo "$ODOO_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart serverchest-agent" > "$SUDOERS_FILE"
+cat > "$SUDOERS_FILE" << SUDOEOF
+$ODOO_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart serverchest-agent
+$ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart serverchest-agent
+$ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop *
+$ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start *
+$ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart *
+SUDOEOF
 chmod 0440 "$SUDOERS_FILE"
 
 systemctl daemon-reload
