@@ -1077,6 +1077,37 @@ def action_restore_backup(params, cfg):
         if pg_rc > 1:
             raise RuntimeError(f'pg_restore failed (rc={pg_rc}): {pg_stderr.strip()[:500]}')
 
+        # --- Filestore restore ---
+        # Read fs_remote from backup_destinations.json (same source as backup script)
+        fs_remote = None
+        fs_restored = False
+        fs_error = None
+        dest_file = '/opt/odoo17/backup_destinations.json'
+        if os.path.isfile(dest_file):
+            try:
+                with open(dest_file) as f:
+                    dests = json.load(f)
+                if dests and dests[0].get('fs_path'):
+                    fs_remote = dests[0]['fs_path'].rstrip('/')
+            except Exception:
+                pass
+        odoo_home = cfg.get('odoo_home', '/opt/odoo17')
+        filestore_local = os.path.join(odoo_home, '.local', 'share', 'Odoo', 'filestore', db)
+        if fs_remote and shutil.which('rclone'):
+            log.info('[restore] Syncing filestore from %s → %s', fs_remote, filestore_local)
+            os.makedirs(filestore_local, exist_ok=True)
+            _, fs_err, fs_rc = _run(
+                base_rclone + ['sync', fs_remote, filestore_local, '--transfers', '8'],
+                timeout=1800)
+            if fs_rc != 0:
+                fs_error = fs_err.strip()[:300]
+                log.warning('[restore] Filestore sync failed: %s', fs_error)
+            else:
+                fs_restored = True
+                log.info('[restore] Filestore restored from cloud')
+        else:
+            log.info('[restore] No filestore remote configured — skipping filestore restore')
+
         log.info('[restore] Starting %s', svc)
         _run(['sudo', 'systemctl', 'start', svc], timeout=60)
 
@@ -1103,6 +1134,8 @@ def action_restore_backup(params, cfg):
             'dump_size_human': _human_size(dump_size),
             'svc_active': svc_active,
             'db_ready': db_ready,
+            'filestore_restored': fs_restored,
+            'filestore_error': fs_error,
         }
     except Exception:
         try:
