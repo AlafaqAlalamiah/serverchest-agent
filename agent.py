@@ -528,7 +528,7 @@ def action_run_manual_backup(params, cfg):
 
     tmp_dir = _tempfile.mkdtemp(prefix='sc_manual_')
     try:
-        write_log('[MANUAL] Backup started')
+        write_log(f'[MANUAL] Backup started (db: {db})')
 
         # ── 1. Database dump ──────────────────────────────────────────────────
         dump_file = os.path.join(tmp_dir, f'{db}_manual.dump')
