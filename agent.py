@@ -432,7 +432,7 @@ def action_trigger_backup(params, cfg):
         start_pos = 0
     subprocess.Popen(
         ['/bin/bash', script],
-        env={**os.environ, 'DB_NAME': cfg.get('db_name', '')},
+        env={**os.environ, 'DB_NAME': cfg.get('db_name', ''), 'TRIGGER_TYPE': 'app'},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
