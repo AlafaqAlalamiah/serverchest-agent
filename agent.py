@@ -810,6 +810,15 @@ def action_update_backup_script(params, cfg):
             new_content, flags=re.MULTILINE
         )
 
+    # Always write the real DB_NAME from agent config (overrides placeholder or stale value)
+    agent_db = cfg.get('db_name', '').strip()
+    if agent_db and agent_db != 'YOUR_DB_NAME':
+        new_content = re.sub(
+            r'^(DB_NAME=)["\']?[^"\'\n]*["\']?',
+            rf'\g<1>"{agent_db}"',
+            new_content, flags=re.MULTILINE
+        )
+
     # Write atomically via temp file
     script_dir = os.path.dirname(script)
     with tempfile.NamedTemporaryFile('w', dir=script_dir, delete=False, suffix='.tmp') as tmp:
