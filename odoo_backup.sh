@@ -4,7 +4,7 @@ export TZ='Asia/Riyadh'   # force consistent timestamps regardless of caller
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 SCRIPT_VERSION="20260528"
-DB_NAME="YOUR_DB_NAME"
+DB_NAME="${DB_NAME:-YOUR_DB_NAME}"
 BACKUP_DIR="/opt/odoo17/backup/tmp"
 FILESTORE="/opt/odoo17/.local/share/Odoo/filestore/$DB_NAME"
 # Legacy single-destination (used if backup_destinations.json doesn't exist)
@@ -77,7 +77,7 @@ trap 'log "[ERROR] Failed at step: $CURRENT_STEP"; log "===== Backup FAILED ====
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 touch "$RCLONE_LOG" 2>/dev/null || true
-log "===== Backup started ====="
+log "===== Backup started (db: $DB_NAME) ====="
 echo "=== rclone run: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$RCLONE_LOG"
 
 # ─── Pre-hook ─────────────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ fi
 # ─── Step 1: Database dump ────────────────────────────────────────────────────
 step_begin "Database dump"
 mkdir -p "$BACKUP_DIR"
-DUMP_FILE="$BACKUP_DIR/db_daily_$DATE.dump"
+DUMP_FILE="$BACKUP_DIR/${DB_NAME}_daily_$DATE.dump"
 
 if [ "$(whoami)" = "odoo17" ]; then
     pg_dump -Fc "$DB_NAME" > "$DUMP_FILE"
@@ -102,6 +102,12 @@ DUMP_SIZE=$(du -sh "$DUMP_FILE" | cut -f1)
 DUMP_SIZE_BYTES=$(stat -c%s "$DUMP_FILE" 2>/dev/null || stat -f%z "$DUMP_FILE" 2>/dev/null || echo 0)
 step_end
 log "[INFO] Dump size: $DUMP_SIZE"
+
+# Verify the dump is a valid PostgreSQL archive before uploading
+step_begin "Verify dump integrity"
+pg_restore --list "$DUMP_FILE" > /dev/null 2>&1 || { log "[ERROR] Dump verification failed — archive is corrupt or incomplete"; exit 1; }
+step_end
+log "[INFO] Dump verified (valid PostgreSQL archive)"
 
 # ─── Load destinations ────────────────────────────────────────────────────────
 # Read backup_destinations.json into parallel arrays (one call to python3)
@@ -169,7 +175,7 @@ upload_to_dest() {
 
     if [ "$DAY_OF_WEEK" -eq 7 ] && [ "$use_weekly" = "true" ]; then
         step_begin "Upload weekly [$dest_name]"
-        rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/weekly/db_weekly_$DATE.dump" \
+        rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/weekly/${DB_NAME}_weekly_$DATE.dump" \
             --log-level NOTICE --log-file "$RCLONE_LOG" \
             || log "[WARN] Upload failed for $dest_name (weekly)"
         step_end
@@ -179,7 +185,7 @@ upload_to_dest() {
 
     if [ "$DAY_OF_MONTH" -eq 01 ] && [ "$use_monthly" = "true" ]; then
         step_begin "Upload monthly [$dest_name]"
-        rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/monthly/db_monthly_$DATE.dump" \
+        rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/monthly/${DB_NAME}_monthly_$DATE.dump" \
             --log-level NOTICE --log-file "$RCLONE_LOG" \
             || log "[WARN] Upload failed for $dest_name (monthly)"
         step_end
