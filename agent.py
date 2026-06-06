@@ -498,18 +498,10 @@ def action_get_backup_config(params, cfg):
     return config
 
 
-def action_run_manual_backup(params, cfg):
-    """Run a one-off manual backup (DB dump + filestore sync) to specific rclone destinations."""
+def _run_manual_backup(db, destinations, params, cfg):
+    """Core implementation — runs synchronously, called directly or from a thread."""
     import tempfile as _tempfile
     import datetime as _dt
-
-    db = (params.get('db') or cfg.get('db_name', '')).strip()
-    if not db:
-        raise ValueError('db is required')
-
-    destinations = params.get('destinations', [])
-    if not destinations:
-        raise ValueError('at least one destination is required')
 
     include_filestore = params.get('include_filestore', True)
     rclone_conf = cfg.get('rclone_config', '')
@@ -518,6 +510,7 @@ def action_run_manual_backup(params, cfg):
     odoo_home = cfg.get('odoo_home', '')
     filestore_local = os.path.join(odoo_home, '.local', 'share', 'Odoo', 'filestore', db)
     start_dt = _dt.datetime.now()
+    fs_size = None
 
     def write_log(msg):
         ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -607,13 +600,34 @@ def action_run_manual_backup(params, cfg):
             'db': db,
             'dump_size': dump_size,
             'dump_size_human': _human_size(dump_size),
-            'filestore_size': fs_size if has_filestore else None,
+            'filestore_size': fs_size,
             'destinations': dest_results,
         }
-    except Exception:
+    except Exception as e:
+        write_log(f'Backup FAILED step: manual ({e})')
         raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def action_run_manual_backup(params, cfg):
+    """Run a one-off manual backup. If params['async'] is True, starts in background and returns immediately."""
+    import datetime as _dt
+
+    db = (params.get('db') or cfg.get('db_name', '')).strip()
+    if not db:
+        raise ValueError('db is required')
+
+    destinations = params.get('destinations', [])
+    if not destinations:
+        raise ValueError('at least one destination is required')
+
+    if params.get('async'):
+        t = threading.Thread(target=_run_manual_backup, args=(db, destinations, params, cfg), daemon=True)
+        t.start()
+        return {'status': 'started', 'db': db}
+
+    return _run_manual_backup(db, destinations, params, cfg)
 
 
 def action_set_backup_config(params, cfg):
