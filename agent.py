@@ -1106,38 +1106,52 @@ def action_list_backups(params, cfg):
                 pass
         backups[tier] = tier_files
 
-    # Manual tier: check per-db subfolder first (new path), then fall back to
-    # the legacy flat folder filtered by db name prefix to avoid showing other
-    # databases' backups.
+    # Manual tier: scan all per-db subfolders under manual/ so that backups of any
+    # database on this server (not just cfg db_name) are listed.
     manual_files = []
     seen_manual = set()
-    manual_candidates = []
-    if db_name:
-        manual_candidates.append((f'{backup_remote}/manual/{db_name}/', f'{backup_remote}/manual/{db_name}'))
-    manual_candidates.append((f'{backup_remote}/manual/', f'{backup_remote}/manual'))
-    for manual_path, path_prefix in manual_candidates:
-        stdout, stderr, rc = _run(base_cmd + [manual_path], timeout=60)
+
+    # 1. Scan manual/ — collect direct .dump files (legacy flat) and subdirectory names
+    manual_subdirs = []  # list of (subdir_name, subdir_path_prefix)
+    stdout, _, rc = _run(base_cmd + [f'{backup_remote}/manual/'], timeout=60)
+    if rc == 0 and stdout.strip():
+        try:
+            for entry in json.loads(stdout):
+                name = entry.get('Name', '')
+                if entry.get('IsDir'):
+                    manual_subdirs.append((name, f'{backup_remote}/manual/{name}'))
+                elif name.endswith('.dump') and name not in seen_manual:
+                    seen_manual.add(name)
+                    manual_files.append({
+                        'name': name,
+                        'path': f'{backup_remote}/manual/{name}',
+                        'size': entry.get('Size', 0),
+                        'size_human': _human_size(entry.get('Size', 0)),
+                        'modified': entry.get('ModTime', ''),
+                    })
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 2. Scan each per-db subfolder (e.g. manual/alafaq01/, manual/bennema/)
+    for subdir_name, path_prefix in manual_subdirs:
+        stdout, _, rc = _run(base_cmd + [path_prefix + '/'], timeout=60)
         if rc == 0 and stdout.strip():
             try:
                 for entry in json.loads(stdout):
                     name = entry.get('Name', '')
-                    if entry.get('IsDir') or not name.endswith('.dump'):
+                    if not name.endswith('.dump') or name in seen_manual:
                         continue
-                    # For the flat legacy folder, only show files belonging to this db
-                    if manual_path.endswith('/manual/') and db_name:
-                        if not name.startswith(f'{db_name}_'):
-                            continue
-                    if name not in seen_manual:
-                        seen_manual.add(name)
-                        manual_files.append({
-                            'name': name,
-                            'path': f'{path_prefix}/{name}',
-                            'size': entry.get('Size', 0),
-                            'size_human': _human_size(entry.get('Size', 0)),
-                            'modified': entry.get('ModTime', ''),
-                        })
+                    seen_manual.add(name)
+                    manual_files.append({
+                        'name': name,
+                        'path': f'{path_prefix}/{name}',
+                        'size': entry.get('Size', 0),
+                        'size_human': _human_size(entry.get('Size', 0)),
+                        'modified': entry.get('ModTime', ''),
+                    })
             except (json.JSONDecodeError, KeyError):
                 pass
+
     manual_files.sort(key=lambda x: x['modified'], reverse=True)
     backups['manual'] = manual_files
 
@@ -1306,7 +1320,10 @@ def action_restore_backup(params, cfg):
     if allowed_remotes and not any(rclone_path.startswith(r + ':') for r in allowed_remotes):
         raise ValueError(f'Invalid backup path: remote not in allowed list ({sorted(allowed_remotes)})')
 
-    db = cfg['db_name']
+    # target_db: explicit param > infer from dump filename > cfg db_name
+    # This allows restoring a backup of a non-primary database hosted on the same server.
+    target_db_param = params.get('target_db', '').strip()
+    db = target_db_param or cfg['db_name']
     if not db:
         raise ValueError('db_name not configured')
     svc = cfg['service_name']
