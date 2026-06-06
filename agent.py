@@ -1286,11 +1286,25 @@ def action_restore_backup(params, cfg):
     if not rclone_path.endswith('.dump'):
         raise ValueError('Invalid backup path: must be a .dump file')
 
-    backup_remote = cfg.get('backup_remote', '')
-    if backup_remote:
-        remote_name = backup_remote.split(':')[0]
-        if not rclone_path.startswith(remote_name + ':'):
-            raise ValueError(f'Invalid backup path: expected remote {remote_name}:')
+    # Security: path must reference a known rclone remote (backup_remote config or any
+    # remote listed in backup_destinations.json) to prevent path-traversal abuse.
+    allowed_remotes = set()
+    legacy_remote = cfg.get('backup_remote', '')
+    if legacy_remote:
+        allowed_remotes.add(legacy_remote.split(':')[0])
+    dest_file = os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
+    if os.path.isfile(dest_file):
+        try:
+            with open(dest_file) as _df:
+                for _d in json.load(_df):
+                    for _key in ('db_path', 'fs_path'):
+                        _v = (_d.get(_key) or '').strip()
+                        if ':' in _v:
+                            allowed_remotes.add(_v.split(':')[0])
+        except Exception:
+            pass
+    if allowed_remotes and not any(rclone_path.startswith(r + ':') for r in allowed_remotes):
+        raise ValueError(f'Invalid backup path: remote not in allowed list ({sorted(allowed_remotes)})')
 
     db = cfg['db_name']
     if not db:
@@ -1332,20 +1346,6 @@ def action_restore_backup(params, cfg):
                 f'database is "{db}". Restore aborted to prevent data loss.'
             )
         log.info('[restore] Database name verified: %s', dump_dbname or '(not found in header)')
-
-        # Validate dump belongs to the configured database
-        dump_db = None
-        for line in vf_stdout.splitlines():
-            if line.startswith(';') and 'dbname:' in line:
-                dump_db = line.split('dbname:')[1].strip()
-                break
-        if dump_db and dump_db != db:
-            raise ValueError(
-                f'Backup mismatch: this dump belongs to database "{dump_db}" '
-                f'but this server is configured for "{db}". Restore aborted to prevent data loss.'
-            )
-        if dump_db:
-            log.info('[restore] Dump dbname validated: %s', dump_db)
 
         if dry_run:
             log.info('[restore] Dry run complete — skipping database changes')
