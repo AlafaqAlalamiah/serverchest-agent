@@ -567,7 +567,7 @@ def action_run_manual_backup(params, cfg):
                 db_ok = 'fail'
                 any_failed = True
             else:
-                remote_path = f'{db_path}/manual/{remote_filename}'
+                remote_path = f'{db_path}/manual/{db}/{remote_filename}'
                 log.info('[manual_backup] Uploading DB to %s', remote_path)
                 _, err, rc = _run(base_rclone + ['copyto', dump_file, remote_path], timeout=300)
                 if rc != 0:
@@ -1105,8 +1105,9 @@ def action_list_backups(params, cfg):
     rclone_conf = cfg.get('rclone_config', '')
     base_cmd = ['rclone', '--config', rclone_conf, 'lsjson'] if rclone_conf else ['rclone', 'lsjson']
 
+    db_name = cfg.get('db_name', '')
     backups = {}
-    for tier in ('daily', 'weekly', 'monthly', 'manual'):
+    for tier in ('daily', 'weekly', 'monthly'):
         remote_path = f'{backup_remote}/{tier}/'
         stdout, stderr, rc = _run(base_cmd + [remote_path], timeout=60)
         tier_files = []
@@ -1127,6 +1128,41 @@ def action_list_backups(params, cfg):
             except (json.JSONDecodeError, KeyError):
                 pass
         backups[tier] = tier_files
+
+    # Manual tier: check per-db subfolder first (new path), then fall back to
+    # the legacy flat folder filtered by db name prefix to avoid showing other
+    # databases' backups.
+    manual_files = []
+    seen_manual = set()
+    manual_candidates = []
+    if db_name:
+        manual_candidates.append((f'{backup_remote}/manual/{db_name}/', f'{backup_remote}/manual/{db_name}'))
+    manual_candidates.append((f'{backup_remote}/manual/', f'{backup_remote}/manual'))
+    for manual_path, path_prefix in manual_candidates:
+        stdout, stderr, rc = _run(base_cmd + [manual_path], timeout=60)
+        if rc == 0 and stdout.strip():
+            try:
+                for entry in json.loads(stdout):
+                    name = entry.get('Name', '')
+                    if entry.get('IsDir') or not name.endswith('.dump'):
+                        continue
+                    # For the flat legacy folder, only show files belonging to this db
+                    if manual_path.endswith('/manual/') and db_name:
+                        if not name.startswith(f'{db_name}_'):
+                            continue
+                    if name not in seen_manual:
+                        seen_manual.add(name)
+                        manual_files.append({
+                            'name': name,
+                            'path': f'{path_prefix}/{name}',
+                            'size': entry.get('Size', 0),
+                            'size_human': _human_size(entry.get('Size', 0)),
+                            'modified': entry.get('ModTime', ''),
+                        })
+            except (json.JSONDecodeError, KeyError):
+                pass
+    manual_files.sort(key=lambda x: x['modified'], reverse=True)
+    backups['manual'] = manual_files
 
     return {'backups': backups, 'total': sum(len(v) for v in backups.values()), 'remote': backup_remote}
 
@@ -1289,6 +1325,34 @@ def action_restore_backup(params, cfg):
         object_count = len([l for l in vf_stdout.strip().splitlines() if l and not l.startswith(';')])
         log.info('[restore] Dump integrity OK (%d objects listed)', object_count)
 
+        # Validate dump belongs to the configured database
+        dump_dbname = None
+        for _line in vf_stdout.splitlines():
+            _m = re.match(r';\s+dbname:\s+(.+)', _line)
+            if _m:
+                dump_dbname = _m.group(1).strip()
+                break
+        if dump_dbname and dump_dbname != db:
+            raise RuntimeError(
+                f'Database mismatch: this dump belongs to "{dump_dbname}" but the configured '
+                f'database is "{db}". Restore aborted to prevent data loss.'
+            )
+        log.info('[restore] Database name verified: %s', dump_dbname or '(not found in header)')
+
+        # Validate dump belongs to the configured database
+        dump_db = None
+        for line in vf_stdout.splitlines():
+            if line.startswith(';') and 'dbname:' in line:
+                dump_db = line.split('dbname:')[1].strip()
+                break
+        if dump_db and dump_db != db:
+            raise ValueError(
+                f'Backup mismatch: this dump belongs to database "{dump_db}" '
+                f'but this server is configured for "{db}". Restore aborted to prevent data loss.'
+            )
+        if dump_db:
+            log.info('[restore] Dump dbname validated: %s', dump_db)
+
         if dry_run:
             log.info('[restore] Dry run complete — skipping database changes')
             return {
@@ -1298,7 +1362,8 @@ def action_restore_backup(params, cfg):
                 'dump_size': dump_size,
                 'dump_size_human': _human_size(dump_size),
                 'object_count': object_count,
-                'message': f'Dump is valid — {object_count} objects, {_human_size(dump_size)}',
+                'dump_dbname': dump_dbname,
+                'message': f'Dump is valid — {object_count} objects, {_human_size(dump_size)}' + (f' · source db: {dump_dbname}' if dump_dbname else ''),
             }
 
         log.info('[restore] Stopping %s', svc)
@@ -1310,9 +1375,11 @@ def action_restore_backup(params, cfg):
               f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
               f"WHERE datname='{db}' AND pid <> pg_backend_pid();"], timeout=15)
 
-        log.info('[restore] Recreating database %s', db)
+        odoo_user = cfg.get('odoo_user', '')
+        log.info('[restore] Recreating database %s (owner: %s)', db, odoo_user)
         _run(['psql', '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{db}"'], timeout=30)
-        _run(['psql', '-d', 'postgres', '-c', f'CREATE DATABASE "{db}"'], timeout=30)
+        create_sql = f'CREATE DATABASE "{db}"' + (f' OWNER "{odoo_user}"' if odoo_user else '')
+        _run(['psql', '-d', 'postgres', '-c', create_sql], timeout=30)
 
         log.info('[restore] Running pg_restore')
         pg_stdout, pg_stderr, pg_rc = _run(
