@@ -77,7 +77,7 @@ trap 'log "[ERROR] Failed at step: $CURRENT_STEP"; log "===== Backup FAILED ====
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 touch "$RCLONE_LOG" 2>/dev/null || true
-log "===== Backup started (db: $DB_NAME) ====="
+log "===== Backup started (db: $DB_NAME) [trigger: ${TRIGGER_TYPE:-scheduled}] ====="
 echo "=== rclone run: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$RCLONE_LOG"
 
 # ─── Pre-hook ─────────────────────────────────────────────────────────────────

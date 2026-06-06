@@ -432,7 +432,7 @@ def action_trigger_backup(params, cfg):
         start_pos = 0
     subprocess.Popen(
         ['/bin/bash', script],
-        env={**os.environ, 'DB_NAME': cfg.get('db_name', '')},
+        env={**os.environ, 'DB_NAME': cfg.get('db_name', ''), 'TRIGGER_TYPE': 'app'},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -807,6 +807,15 @@ def action_update_backup_script(params, cfg):
         new_content = re.sub(
             rf'^({var}=)["\']?[^"\'\n]*["\']?',
             rf'\g<1>"{val}"',
+            new_content, flags=re.MULTILINE
+        )
+
+    # Always write the real DB_NAME from agent config (overrides placeholder or stale value)
+    agent_db = cfg.get('db_name', '').strip()
+    if agent_db and agent_db != 'YOUR_DB_NAME':
+        new_content = re.sub(
+            r'^(DB_NAME=)["\']?[^"\'\n]*["\']?',
+            rf'\g<1>"{agent_db}"',
             new_content, flags=re.MULTILINE
         )
 
