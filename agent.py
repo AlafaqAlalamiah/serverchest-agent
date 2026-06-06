@@ -1233,6 +1233,23 @@ def action_verify_backup(params, cfg):
                         db_size_human = _human_size(db_size)
                         db_path = f'{base_path}/{tier}/{name}'
                         break
+                    # Manual backups are stored in a per-db subfolder: manual/{db}/filename.dump
+                    if tier == 'manual' and entry.get('IsDir'):
+                        sub_stdout, _, sub_rc = _run(base_cmd + [f'{base_path}/{tier}/{name}/'], timeout=30)
+                        if sub_rc == 0 and sub_stdout.strip():
+                            try:
+                                for sub_entry in json.loads(sub_stdout):
+                                    sub_name = sub_entry.get('Name', '')
+                                    if date_compact in sub_name and sub_name.endswith('.dump'):
+                                        db_ok = sub_entry.get('Size', 0) > 0
+                                        db_size = sub_entry.get('Size', 0)
+                                        db_size_human = _human_size(db_size)
+                                        db_path = f'{base_path}/{tier}/{name}/{sub_name}'
+                                        break
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                    if db_path:
+                        break
             except (json.JSONDecodeError, KeyError):
                 pass
             if db_path:
