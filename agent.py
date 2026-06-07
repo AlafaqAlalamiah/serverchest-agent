@@ -1406,8 +1406,21 @@ def action_restore_backup(params, cfg):
     # Download a specific backup from rclone and restore it to the database.
     # If dry_run=True: download + verify integrity only, no DB changes.
     import tempfile as _tempfile
+    import datetime as _dt
+    
+    restore_start = _dt.datetime.now()
     rclone_path = params.get('path', '').strip()
     dry_run = bool(params.get('dry_run', False))
+    log_path = cfg.get('backup_log', '/var/log/odoo/backup.log')
+    
+    def write_restore_log(msg):
+        ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            with open(log_path, 'a') as f:
+                f.write(f'[{ts}] {msg}\n')
+        except Exception:
+            pass
+    
     if not rclone_path:
         raise ValueError('path is required')
     if not rclone_path.endswith('.dump'):
@@ -1605,6 +1618,16 @@ def action_restore_backup(params, cfg):
             )
 
         log.info('[restore] Complete — service active, database ready')
+        
+        # Write structured restore log entry for audit trail
+        elapsed = int((_dt.datetime.now() - restore_start).total_seconds())
+        mins, secs = divmod(elapsed, 60)
+        backup_file = rclone_path.split('/')[-1]
+        write_restore_log(f'[RESTORE] from={backup_file} db={db} size={_human_size(dump_size)} '
+                         f'duration={mins}m{secs}s filestore={fs_restored} '
+                         f'cross_server={cross_server_restore} '
+                         f'source_server={source_server_name or "same"} status=success')
+        
         result = {
             'status': 'ok',
             'restored_from': rclone_path,
@@ -1620,7 +1643,13 @@ def action_restore_backup(params, cfg):
             result['cross_server_restore'] = True
             result['source_server_name'] = source_server_name
         return result
-    except Exception:
+    except Exception as e:
+        # Log restore failure
+        elapsed = int((_dt.datetime.now() - restore_start).total_seconds())
+        mins, secs = divmod(elapsed, 60)
+        backup_file = rclone_path.split('/')[-1] if rclone_path else 'unknown'
+        write_restore_log(f'[RESTORE] from={backup_file} db={db} '
+                         f'duration={mins}m{secs}s status=failed error={str(e)[:200]}')
         try:
             _run(['sudo', 'systemctl', 'start', svc], timeout=60)
         except Exception:
