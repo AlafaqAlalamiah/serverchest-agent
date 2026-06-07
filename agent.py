@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 import urllib.request
 
 try:
@@ -29,6 +30,56 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE = os.environ.get('SERVERCHEST_CONFIG', '/etc/serverchest-agent.conf')
+
+# ── Backup run outbox ─────────────────────────────────────────────────────────
+# When the WS is not yet available (e.g. backup finishes in a background thread),
+# records are written to a local JSON file and flushed on the next send opportunity.
+
+OUTBOX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backup_outbox.json')
+_outbox_lock = threading.Lock()
+
+def _outbox_write(record: dict):
+    """Append a backup_run record to the local outbox file (thread-safe)."""
+    with _outbox_lock:
+        records = []
+        if os.path.isfile(OUTBOX_FILE):
+            try:
+                with open(OUTBOX_FILE) as f:
+                    records = json.load(f)
+                if not isinstance(records, list):
+                    records = []
+            except Exception:
+                records = []
+        records.append(record)
+        try:
+            with open(OUTBOX_FILE, 'w') as f:
+                json.dump(records, f)
+        except Exception as e:
+            log.warning('[outbox] Failed to write outbox: %s', e)
+
+def _outbox_read_and_clear() -> list:
+    """Read all pending records and atomically clear the file (thread-safe)."""
+    with _outbox_lock:
+        if not os.path.isfile(OUTBOX_FILE):
+            return []
+        try:
+            with open(OUTBOX_FILE) as f:
+                records = json.load(f)
+            os.remove(OUTBOX_FILE)
+            return records if isinstance(records, list) else []
+        except Exception:
+            return []
+
+async def _outbox_flush(ws):
+    """Send all pending outbox records over the WebSocket. Called on reconnect."""
+    records = _outbox_read_and_clear()
+    for rec in records:
+        try:
+            await ws.send(json.dumps({'type': 'backup_run', 'data': rec}))
+            log.info('[outbox] Flushed backup_run %s', rec.get('id', '?'))
+        except Exception as e:
+            log.warning('[outbox] Failed to flush record %s: %s — re-queuing', rec.get('id', '?'), e)
+            _outbox_write(rec)
 
 def _autodetect_paths(s):
     """Fill any missing config values by probing the filesystem at startup.
@@ -430,9 +481,10 @@ def action_trigger_backup(params, cfg):
         start_pos = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
     except Exception:
         start_pos = 0
+    run_id = str(uuid.uuid4())
     subprocess.Popen(
         ['/bin/bash', script],
-        env={**os.environ, 'DB_NAME': cfg.get('db_name', ''), 'TRIGGER_TYPE': 'app'},
+        env={**os.environ, 'DB_NAME': cfg.get('db_name', ''), 'TRIGGER_TYPE': 'app', 'SC_RUN_ID': run_id},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -503,6 +555,7 @@ def _run_manual_backup(db, destinations, params, cfg):
     import tempfile as _tempfile
     import datetime as _dt
 
+    run_id = params.get('run_id') or str(uuid.uuid4())
     include_filestore = params.get('include_filestore', True)
     rclone_conf = cfg.get('rclone_config', '')
     base_rclone = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
@@ -520,9 +573,15 @@ def _run_manual_backup(db, destinations, params, cfg):
         except Exception:
             pass
 
+    # Report start immediately so the UI shows "running"
+    _outbox_write({
+        'id': run_id, 'type': 'manual', 'tier': 'manual', 'dbName': db,
+        'status': 'running', 'startedAt': start_dt.isoformat(),
+    })
+
     tmp_dir = _tempfile.mkdtemp(prefix='sc_manual_')
     try:
-        write_log(f'[MANUAL] Backup started (db: {db})')
+        write_log(f'[MANUAL] Backup started (db: {db}) [run_id: {run_id}]')
 
         # ── 1. Database dump ──────────────────────────────────────────────────
         dump_file = os.path.join(tmp_dir, f'{db}_manual.dump')
@@ -546,6 +605,7 @@ def _run_manual_backup(db, destinations, params, cfg):
         ts_str = start_dt.strftime('%Y%m%d_%H%M')
         remote_filename = f'{db}_manual_{ts_str}.dump'
         dest_results = []
+        cloud_paths = []
         any_failed = False
 
         for dest in destinations:
@@ -568,6 +628,8 @@ def _run_manual_backup(db, destinations, params, cfg):
                     db_ok = 'fail'
                     any_failed = True
                     log.warning('[manual_backup] DB upload failed for %s: %s', name, err.strip()[:200])
+                else:
+                    cloud_paths.append({'destName': name, 'path': remote_path})
 
             # Filestore sync
             if include_filestore and has_filestore and fs_path:
@@ -595,6 +657,17 @@ def _run_manual_backup(db, destinations, params, cfg):
         mins, secs = divmod(elapsed, 60)
         write_log(f'Backup complete total: {mins}m {secs}s')
 
+        completed_at = _dt.datetime.now().isoformat()
+        _outbox_write({
+            'id': run_id, 'type': 'manual', 'tier': 'manual', 'dbName': db,
+            'status': 'success',
+            'cloudPaths': cloud_paths,
+            'dumpSize': dump_size,
+            'startedAt': start_dt.isoformat(),
+            'completedAt': completed_at,
+            'durationSecs': elapsed,
+        })
+
         return {
             'status': 'ok',
             'db': db,
@@ -605,6 +678,14 @@ def _run_manual_backup(db, destinations, params, cfg):
         }
     except Exception as e:
         write_log(f'Backup FAILED step: manual ({e})')
+        _outbox_write({
+            'id': run_id, 'type': 'manual', 'tier': 'manual', 'dbName': db,
+            'status': 'failed',
+            'failStep': 'manual',
+            'errorMsg': str(e)[:500],
+            'startedAt': start_dt.isoformat(),
+            'completedAt': _dt.datetime.now().isoformat(),
+        })
         raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2537,6 +2618,9 @@ async def agent_loop(cfg):
 
                 log.info('Authenticated as server %s (%s)',
                          auth_reply.get('server_id'), auth_reply.get('server_name'))
+
+                # Flush any backup_run records that were queued while offline
+                await _outbox_flush(ws)
 
                 # Run command handler and monitoring loop concurrently.
                 # If either task finishes (command loop closed, WS error), cancel the other

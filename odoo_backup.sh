@@ -22,6 +22,13 @@ DATE=$(date +%Y%m%d_%H%M)
 DAY_OF_WEEK=$(date +%u)    # 1=Mon ... 7=Sun
 DAY_OF_MONTH=$(date +%d)
 
+# Determine tier for this run (daily always runs; weekly on Sunday; monthly on 1st)
+BACKUP_TIER="daily"
+[ "$DAY_OF_WEEK"  -eq 7  ] && BACKUP_TIER="weekly"
+[ "$DAY_OF_MONTH" -eq 01 ] && BACKUP_TIER="monthly"
+
+declare -a DEST_UPLOAD_OK   # parallel array: "ok" or "fail" per destination
+
 BACKUP_START=$SECONDS
 CURRENT_STEP="init"
 
@@ -55,11 +62,37 @@ report_backup() {
     local status="$1"  # success | failed
     local secs=$(( SECONDS - BACKUP_START ))
     [ -z "$_SC_API_KEY" ] || [ -z "$_SC_APP_URL" ] && return 0
+
+    # Build cloud_paths JSON array from destinations that uploaded successfully
+    local cloud_paths_json="[]"
+    if command -v python3 &>/dev/null && [ "${DEST_COUNT:-0}" -gt 0 ]; then
+        cloud_paths_json=$(python3 -c "
+import json, sys
+names = sys.argv[1].split('\x1f')
+paths = sys.argv[2].split('\x1f')
+date  = sys.argv[3]
+db    = sys.argv[4]
+tier  = sys.argv[5]
+ok    = sys.argv[6].split('\x1f')
+result = []
+for i, (n, p, o) in enumerate(zip(names, paths, ok)):
+    if o == 'ok' and p:
+        result.append({'destName': n, 'path': f'{p}/{tier}/{db}_{tier}_{date}.dump'})
+print(json.dumps(result))
+" "$(IFS=$'\x1f'; echo "${DEST_NAMES[*]}")" \
+  "$(IFS=$'\x1f'; echo "${DEST_DB_PATHS[*]}")" \
+  "$DATE" "$DB_NAME" "${BACKUP_TIER:-daily}" \
+  "$(IFS=$'\x1f'; echo "${DEST_UPLOAD_OK[*]:-}")" 2>/dev/null || echo "[]")
+    fi
+
+    local run_id="${SC_RUN_ID:-}"
+    [ -z "$run_id" ] && run_id=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "")
+
     curl -sf --max-time 10 \
         -X POST "$_SC_APP_URL/api/internal/backup-report" \
         -H "Content-Type: application/json" \
         -H "x-api-key: $_SC_API_KEY" \
-        -d "{\"status\":\"$status\",\"at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"duration_secs\":$secs,\"db\":\"$DB_NAME\",\"dump_size_bytes\":${DUMP_SIZE_BYTES:-0}}" \
+        -d "{\"status\":\"$status\",\"at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"duration_secs\":$secs,\"db\":\"$DB_NAME\",\"dump_size_bytes\":${DUMP_SIZE_BYTES:-0},\"type\":\"scheduled\",\"tier\":\"${BACKUP_TIER:-daily}\",\"trigger\":\"${TRIGGER_TYPE:-scheduled}\",\"cloud_paths\":$cloud_paths_json,\"run_id\":\"$run_id\"}" \
         > /dev/null 2>&1 || true
 }
 
@@ -165,12 +198,17 @@ upload_to_dest() {
 
     if [ "$use_daily" = "true" ]; then
         step_begin "Upload daily [$dest_name]"
-        rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
-            --log-level NOTICE --log-file "$RCLONE_LOG" \
-            || { log "[WARN] Upload failed for $dest_name (daily)"; db_ok="fail"; }
+        if rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
+            --log-level NOTICE --log-file "$RCLONE_LOG"; then
+            DEST_UPLOAD_OK+=("ok")
+        else
+            log "[WARN] Upload failed for $dest_name (daily)"; db_ok="fail"
+            DEST_UPLOAD_OK+=("fail")
+        fi
         step_end
     else
         log "[SKIP] Daily upload disabled for $dest_name"
+        DEST_UPLOAD_OK+=("skip")
     fi
 
     if [ "$DAY_OF_WEEK" -eq 7 ] && [ "$use_weekly" = "true" ]; then
