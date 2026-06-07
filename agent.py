@@ -1467,6 +1467,20 @@ def action_restore_backup(params, cfg):
               f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
               f"WHERE datname='{db}' AND pid <> pg_backend_pid();"], timeout=15)
 
+        # Save the current server's web.base.url BEFORE dropping the DB.
+        # The restored dump likely has a different domain which would break the Odoo login page.
+        current_base_url = None
+        try:
+            url_out, _, url_rc = _run(
+                ['psql', '-d', db, '-t', '-A', '-c',
+                 "SELECT value FROM ir_config_parameter WHERE key='web.base.url' LIMIT 1"],
+                timeout=10)
+            if url_rc == 0 and url_out.strip():
+                current_base_url = url_out.strip()
+                log.info('[restore] Saved web.base.url: %s', current_base_url)
+        except Exception:
+            pass
+
         odoo_user = cfg.get('odoo_user', '')
         log.info('[restore] Recreating database %s (owner: %s)', db, odoo_user)
         _run(['psql', '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{db}"'], timeout=30)
@@ -1478,6 +1492,15 @@ def action_restore_backup(params, cfg):
             ['pg_restore', '-Fc', '-d', db, dump_file], timeout=600)
         if pg_rc > 1:
             raise RuntimeError(f'pg_restore failed (rc={pg_rc}): {pg_stderr.strip()[:500]}')
+
+        # Fix web.base.url so Odoo login page isn't broken after restore from a different server
+        if current_base_url:
+            log.info('[restore] Restoring web.base.url to %s', current_base_url)
+            _run(['psql', '-d', db, '-c',
+                  f"UPDATE ir_config_parameter SET value='{current_base_url}' WHERE key='web.base.url'"],
+                 timeout=10)
+        # Clear stale sessions from the source server to force fresh logins
+        _run(['psql', '-d', db, '-c', 'DELETE FROM ir_session_store'], timeout=10)
 
         # --- Filestore restore ---
         # Read fs_remote from backup_destinations.json (same source as backup script)
