@@ -81,6 +81,21 @@ async def _outbox_flush(ws):
             log.warning('[outbox] Failed to flush record %s: %s — re-queuing', rec.get('id', '?'), e)
             _outbox_write(rec)
 
+# ── Server identity (set after auth) ──────────────────────────────────────────
+_server_id = None
+_server_name = None
+
+def _create_backup_metadata(db_name: str, timestamp: str, backup_type: str) -> dict:
+    """Generate backup metadata for cross-server restore detection."""
+    return {
+        'server_id': _server_id,
+        'server_name': _server_name,
+        'db_name': db_name,
+        'timestamp': timestamp,
+        'type': backup_type,
+        'agent_version': '1.0',
+    }
+
 def _autodetect_paths(s):
     """Fill any missing config values by probing the filesystem at startup.
     Uses glob patterns so it works with any Odoo version (14, 15, 16, 17, 18, 19…)
@@ -484,7 +499,14 @@ def action_trigger_backup(params, cfg):
     run_id = str(uuid.uuid4())
     subprocess.Popen(
         ['/bin/bash', script],
-        env={**os.environ, 'DB_NAME': cfg.get('db_name', ''), 'TRIGGER_TYPE': 'app', 'SC_RUN_ID': run_id},
+        env={
+            **os.environ,
+            'DB_NAME': cfg.get('db_name', ''),
+            'TRIGGER_TYPE': 'app',
+            'SC_RUN_ID': run_id,
+            '_SC_SERVER_ID': str(_server_id) if _server_id else '',
+            '_SC_SERVER_NAME': _server_name or '',
+        },
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -630,6 +652,16 @@ def _run_manual_backup(db, destinations, params, cfg):
                     log.warning('[manual_backup] DB upload failed for %s: %s', name, err.strip()[:200])
                 else:
                     cloud_paths.append({'destName': name, 'path': remote_path})
+                    # Upload metadata sidecar for cross-server restore detection
+                    meta = _create_backup_metadata(db, ts_str, 'manual')
+                    meta_file = os.path.join(tmp_dir, f'{remote_filename}.meta.json')
+                    try:
+                        with open(meta_file, 'w') as mf:
+                            json.dump(meta, mf)
+                        _run(base_rclone + ['copyto', meta_file, f'{remote_path}.meta.json'], timeout=30)
+                        log.info('[manual_backup] Uploaded metadata to %s.meta.json', remote_path)
+                    except Exception as e:
+                        log.warning('[manual_backup] Failed to upload metadata: %s', e)
 
             # Filestore sync
             if include_filestore and has_filestore and fs_path:
@@ -1413,6 +1445,29 @@ def action_restore_backup(params, cfg):
 
     tmp_dir = _tempfile.mkdtemp(prefix='sc_restore_')
     dump_file = os.path.join(tmp_dir, 'restore.dump')
+    
+    # Check for backup metadata to detect cross-server restore
+    meta_path = f'{rclone_path}.meta.json'
+    meta_file = os.path.join(tmp_dir, 'restore.meta.json')
+    source_server_id = None
+    source_server_name = None
+    cross_server_restore = False
+    
+    try:
+        log.info('[restore] Checking for backup metadata')
+        _, _, meta_rc = _run(base_rclone + ['copyto', meta_path, meta_file], timeout=30)
+        if meta_rc == 0 and os.path.isfile(meta_file):
+            with open(meta_file) as mf:
+                meta = json.load(mf)
+                source_server_id = meta.get('server_id')
+                source_server_name = meta.get('server_name')
+                if source_server_id and _server_id and source_server_id != _server_id:
+                    cross_server_restore = True
+                    log.warning('[restore] CROSS-SERVER RESTORE DETECTED: backup from server %s (%s), current server is %s (%s)',
+                                source_server_id, source_server_name, _server_id, _server_name)
+    except Exception as e:
+        log.info('[restore] No metadata found or failed to read: %s', e)
+    
     try:
         log.info('[restore%s] Downloading %s', ' dry-run' if dry_run else '', rclone_path)
         dl_stdout, dl_stderr, dl_rc = _run(
@@ -1447,7 +1502,7 @@ def action_restore_backup(params, cfg):
 
         if dry_run:
             log.info('[restore] Dry run complete — skipping database changes')
-            return {
+            result = {
                 'dry_run': True,
                 'ok': True,
                 'path': rclone_path,
@@ -1457,6 +1512,13 @@ def action_restore_backup(params, cfg):
                 'dump_dbname': dump_dbname,
                 'message': f'Dump is valid — {object_count} objects, {_human_size(dump_size)}' + (f' · source db: {dump_dbname}' if dump_dbname else ''),
             }
+            if cross_server_restore:
+                result['cross_server_restore'] = True
+                result['source_server_id'] = source_server_id
+                result['source_server_name'] = source_server_name
+                result['target_server_id'] = _server_id
+                result['target_server_name'] = _server_name
+            return result
 
         log.info('[restore] Stopping %s', svc)
         stop_out, stop_err, stop_rc = _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
@@ -1543,7 +1605,7 @@ def action_restore_backup(params, cfg):
             )
 
         log.info('[restore] Complete — service active, database ready')
-        return {
+        result = {
             'status': 'ok',
             'restored_from': rclone_path,
             'db': db,
@@ -1554,6 +1616,10 @@ def action_restore_backup(params, cfg):
             'filestore_restored': fs_restored,
             'filestore_error': fs_error,
         }
+        if cross_server_restore:
+            result['cross_server_restore'] = True
+            result['source_server_name'] = source_server_name
+        return result
     except Exception:
         try:
             _run(['sudo', 'systemctl', 'start', svc], timeout=60)
@@ -2631,6 +2697,11 @@ async def agent_loop(cfg):
 
                 log.info('Authenticated as server %s (%s)',
                          auth_reply.get('server_id'), auth_reply.get('server_name'))
+
+                # Store server identity for backup metadata
+                global _server_id, _server_name
+                _server_id = auth_reply.get('server_id')
+                _server_name = auth_reply.get('server_name')
 
                 # Flush any backup_run records that were queued while offline
                 await _outbox_flush(ws)
