@@ -1467,20 +1467,6 @@ def action_restore_backup(params, cfg):
               f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
               f"WHERE datname='{db}' AND pid <> pg_backend_pid();"], timeout=15)
 
-        # Save the current server's web.base.url BEFORE dropping the DB.
-        # The restored dump likely has a different domain which would break the Odoo login page.
-        current_base_url = None
-        try:
-            url_out, _, url_rc = _run(
-                ['psql', '-d', db, '-t', '-A', '-c',
-                 "SELECT value FROM ir_config_parameter WHERE key='web.base.url' LIMIT 1"],
-                timeout=10)
-            if url_rc == 0 and url_out.strip():
-                current_base_url = url_out.strip()
-                log.info('[restore] Saved web.base.url: %s', current_base_url)
-        except Exception:
-            pass
-
         odoo_user = cfg.get('odoo_user', '')
         log.info('[restore] Recreating database %s (owner: %s)', db, odoo_user)
         _run(['psql', '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{db}"'], timeout=30)
@@ -1493,13 +1479,17 @@ def action_restore_backup(params, cfg):
         if pg_rc > 1:
             raise RuntimeError(f'pg_restore failed (rc={pg_rc}): {pg_stderr.strip()[:500]}')
 
-        # Fix web.base.url so Odoo login page isn't broken after restore from a different server
-        if current_base_url:
-            log.info('[restore] Restoring web.base.url to %s', current_base_url)
-            _run(['psql', '-d', db, '-c',
-                  f"UPDATE ir_config_parameter SET value='{current_base_url}' WHERE key='web.base.url'"],
-                 timeout=10)
-        # Clear stale sessions from the source server to force fresh logins
+        # Clear compiled web asset bundles from the restored DB.
+        # After restore, the ir_attachment records reference file hashes from the source DB's
+        # filestore. If those files don't exist in the local filestore, Odoo serves 404s for
+        # all JS/CSS — login page appears "destroyed". Deleting these forces Odoo to recompile
+        # fresh assets from local addon source on next request.
+        log.info('[restore] Clearing compiled web asset cache')
+        _run(['psql', '-d', db, '-c',
+              "DELETE FROM ir_attachment WHERE res_model = 'ir.ui.view' "
+              "AND (name LIKE '%assets%' OR name LIKE '%.js' OR name LIKE '%.css')"],
+             timeout=15)
+        # Clear stale sessions
         _run(['psql', '-d', db, '-c', 'DELETE FROM ir_session_store'], timeout=10)
 
         # --- Filestore restore ---
