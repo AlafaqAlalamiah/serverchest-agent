@@ -106,6 +106,28 @@ rclone_stats() {
     [ -n "$stats" ] && log "[STATS] $stats"
 }
 
+# Upload backup metadata sidecar for cross-server restore detection
+upload_metadata() {
+    local remote_path="$1"
+    local tier="$2"
+    [ -z "$_SC_SERVER_ID" ] && return 0  # No server ID available, skip
+    
+    local meta_file="${DUMP_FILE}.meta.json"
+    python3 -c "import json; print(json.dumps({
+        'server_id': ${_SC_SERVER_ID},
+        'server_name': '${_SC_SERVER_NAME:-}',
+        'db_name': '${DB_NAME}',
+        'timestamp': '${DATE}',
+        'type': 'scheduled',
+        'tier': '${tier}',
+        'agent_version': '1.0'
+    }))" > "$meta_file" 2>/dev/null || return 0
+    
+    rclone --config "$RCLONE_CONFIG" copyto "$meta_file" "${remote_path}.meta.json" \
+        --log-level NOTICE --log-file "$RCLONE_LOG" 2>/dev/null || true
+    rm -f "$meta_file"
+}
+
 trap 'log "[ERROR] Failed at step: $CURRENT_STEP"; log "===== Backup FAILED ====="; [ "${CLEANUP_LOCAL:-true}" = "true" ] && rm -f "${DUMP_FILE:-}" 2>/dev/null || true; report_backup failed' ERR
 
 # ─── Start ────────────────────────────────────────────────────────────────────
@@ -201,6 +223,7 @@ upload_to_dest() {
         if rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
             --log-level NOTICE --log-file "$RCLONE_LOG"; then
             DEST_UPLOAD_OK+=("ok")
+            upload_metadata "$db_path/daily/${DB_NAME}_daily_${DATE}.dump" "daily"
         else
             log "[WARN] Upload failed for $dest_name (daily)"; db_ok="fail"
             DEST_UPLOAD_OK+=("fail")
@@ -213,9 +236,12 @@ upload_to_dest() {
 
     if [ "$DAY_OF_WEEK" -eq 7 ] && [ "$use_weekly" = "true" ]; then
         step_begin "Upload weekly [$dest_name]"
-        rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/weekly/${DB_NAME}_weekly_$DATE.dump" \
-            --log-level NOTICE --log-file "$RCLONE_LOG" \
-            || log "[WARN] Upload failed for $dest_name (weekly)"
+        if rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/weekly/${DB_NAME}_weekly_$DATE.dump" \
+            --log-level NOTICE --log-file "$RCLONE_LOG"; then
+            upload_metadata "$db_path/weekly/${DB_NAME}_weekly_$DATE.dump" "weekly"
+        else
+            log "[WARN] Upload failed for $dest_name (weekly)"
+        fi
         step_end
     elif [ "$DAY_OF_WEEK" -eq 7 ]; then
         log "[SKIP] Weekly upload disabled for $dest_name"
@@ -223,9 +249,12 @@ upload_to_dest() {
 
     if [ "$DAY_OF_MONTH" -eq 01 ] && [ "$use_monthly" = "true" ]; then
         step_begin "Upload monthly [$dest_name]"
-        rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/monthly/${DB_NAME}_monthly_$DATE.dump" \
-            --log-level NOTICE --log-file "$RCLONE_LOG" \
-            || log "[WARN] Upload failed for $dest_name (monthly)"
+        if rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/monthly/${DB_NAME}_monthly_$DATE.dump" \
+            --log-level NOTICE --log-file "$RCLONE_LOG"; then
+            upload_metadata "$db_path/monthly/${DB_NAME}_monthly_$DATE.dump" "monthly"
+        else
+            log "[WARN] Upload failed for $dest_name (monthly)"
+        fi
         step_end
     elif [ "$DAY_OF_MONTH" -eq 01 ]; then
         log "[SKIP] Monthly upload disabled for $dest_name"
