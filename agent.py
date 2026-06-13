@@ -808,7 +808,9 @@ def action_set_backup_config(params, cfg):
         odoo_user = cfg.get('odoo_user', '')
         stdout, _, _ = _run(['crontab', '-u', odoo_user, '-l'])
         lines = [l for l in stdout.splitlines() if script not in l]
-        lines.append(f"{params['cron_schedule']} {script}")
+        # Only add schedule back if it's not empty/null (allows clearing)
+        if params['cron_schedule']:
+            lines.append(f"{params['cron_schedule']} {script}")
         new_crontab = '\n'.join(lines) + '\n'
         _run(['crontab', '-u', odoo_user, '-'], input=new_crontab)
 
