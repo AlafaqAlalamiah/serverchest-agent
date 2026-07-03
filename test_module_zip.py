@@ -88,3 +88,20 @@ def test_bad_module_name_rejected():
     data = make_zip({'my module!/__manifest__.py': b'{}'})
     with pytest.raises(ValueError, match='module name'):
         _validate_module_zip(data)
+
+
+from agent import _parse_custom_addons_paths
+
+
+def test_parse_custom_addons_paths():
+    conf = "[options]\naddons_path = /opt/odoo17/odoo17/addons, /opt/odoo17/custom-addons, /opt/extra\n"
+    assert _parse_custom_addons_paths(conf) == ['/opt/odoo17/custom-addons', '/opt/extra']
+
+
+def test_parse_custom_addons_paths_single_path():
+    conf = "[options]\naddons_path = /opt/odoo/addons\n"
+    assert _parse_custom_addons_paths(conf) == []
+
+
+def test_parse_custom_addons_paths_missing():
+    assert _parse_custom_addons_paths("[options]\ndb_host = localhost\n") == []

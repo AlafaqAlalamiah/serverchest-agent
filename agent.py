@@ -2554,6 +2554,70 @@ def _validate_module_zip(zip_bytes, max_size=MODULE_ZIP_MAX_SIZE,
     return root
 
 
+def _parse_custom_addons_paths(conf_text):
+    """First entry in addons_path is treated as core Odoo; the rest are custom.
+    (Same convention as action_get_odoo_info.)"""
+    m = re.search(r'^\s*addons_path\s*=\s*(.+)', conf_text, re.MULTILINE)
+    if not m:
+        return []
+    paths = [p.strip() for p in m.group(1).split(',') if p.strip()]
+    return paths[1:] if len(paths) > 1 else []
+
+def _custom_addons_dirs(cfg):
+    conf_path = cfg.get('odoo_conf', '')
+    if not os.path.isfile(conf_path):
+        return []
+    with open(conf_path) as f:
+        conf_text = f.read()
+    return [p for p in _parse_custom_addons_paths(conf_text) if os.path.isdir(p)]
+
+def action_get_addons_dirs(params, cfg):
+    return {'dirs': _custom_addons_dirs(cfg)}
+
+def _module_psql(db, sql, cfg):
+    """Run a query against an Odoo DB: sudo -u <odoo_user> psql first, plain psql fallback."""
+    base = ['sudo', '-u', cfg.get('odoo_user', ''), 'psql']
+    out, _, rc = _run(base + ['-d', db, '-A', '-F', '\t', '-t', '-c', sql], timeout=30)
+    if rc != 0:
+        out, _, rc = _run(['psql', '-d', db, '-A', '-F', '\t', '-t', '-c', sql], timeout=30)
+    return out, rc
+
+def action_list_modules(params, cfg):
+    db = (params.get('db') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+
+    out, rc = _module_psql(db,
+        "SELECT name, state, COALESCE(latest_version, ''), COALESCE(author, '') "
+        "FROM ir_module_module ORDER BY name;", cfg)
+    if rc != 0:
+        raise RuntimeError(f'Could not query modules for {db}')
+
+    # code versions from custom addons manifests on disk
+    code_versions = {}
+    for path in _custom_addons_dirs(cfg):
+        for d in os.listdir(path):
+            manifest = os.path.join(path, d, '__manifest__.py')
+            if os.path.isfile(manifest):
+                with open(manifest) as mf:
+                    mv = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", mf.read())
+                if mv:
+                    code_versions[d] = mv.group(1)
+
+    modules = []
+    for line in out.strip().splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2 and parts[0]:
+            modules.append({
+                'name':              parts[0],
+                'state':             parts[1],
+                'installed_version': parts[2] if len(parts) > 2 else '',
+                'author':            parts[3] if len(parts) > 3 else '',
+                'code_version':      code_versions.get(parts[0], ''),
+            })
+    return {'db': db, 'modules': modules}
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -2606,6 +2670,8 @@ ACTIONS = {
     'get_db_stats':           action_get_db_stats,
     'get_system_paths':       action_get_system_paths,
     'system_backup':          action_system_backup,
+    'get_addons_dirs':        action_get_addons_dirs,
+    'list_modules':           action_list_modules,
 }
 
 
