@@ -984,6 +984,31 @@ def action_check_backup_script_update(params, cfg):
         'update_available': latest_version is not None and latest_version != current_version,
     }
 
+def action_check_agent_update(params, cfg):
+    """Compare the installed agent.py with the release channel by content hash.
+    (No version constant to maintain — a hash mismatch means an update exists.
+    Note: raw.githubusercontent caches ~5 min after a release.)"""
+    import urllib.request, hashlib
+    local_path = os.path.abspath(__file__)
+    try:
+        with open(local_path, 'rb') as f:
+            local_hash = hashlib.sha256(f.read()).hexdigest()
+    except Exception as e:
+        return {'error': f'Could not read local agent: {e}'}
+    try:
+        with urllib.request.urlopen(AGENT_URL, timeout=15) as resp:
+            remote_hash = hashlib.sha256(resp.read()).hexdigest()
+    except Exception as e:
+        return {'error': f'Could not fetch latest agent: {e}'}
+    installed_at = datetime.datetime.fromtimestamp(
+        os.path.getmtime(local_path)).isoformat(timespec='seconds')
+    return {
+        'update_available': local_hash != remote_hash,
+        'installed': local_hash[:12],
+        'latest': remote_hash[:12],
+        'installed_at': installed_at,
+    }
+
 def action_service_status(params, cfg):
     svc = cfg['service_name']
     stdout, _, rc = _run(['systemctl', 'is-active', svc])
@@ -2832,6 +2857,7 @@ ACTIONS = {
     'update_backup_script':       action_update_backup_script,
     'update_agent':               action_update_agent,
     'check_backup_script_update': action_check_backup_script_update,
+    'check_agent_update':         action_check_agent_update,
     'service_status':     action_service_status,
     'service_control':    action_service_control,
     'get_journal':        action_get_journal,
