@@ -2881,14 +2881,20 @@ def action_cluster_backup(params, cfg):
     rclone_conf = cfg.get('rclone_config', '')
     base = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
 
+    import shlex
     with tempfile.TemporaryDirectory() as td:
         gz_path = os.path.join(td, 'cluster.sql.gz')
-        # pg_dumpall of the entire cluster as the postgres superuser.
-        out, err, rc = _pg_run([pg_dumpall, '--clean', '--if-exists', '--no-role-passwords'], timeout=3600)
-        if not out or (rc != 0 and 'CREATE' not in (out or '')):
-            raise RuntimeError(f'pg_dumpall failed: {(err or "").strip()[:400]}')
-        with gzip.open(gz_path, 'wt') as f:
-            f.write(out)
+        # Stream pg_dumpall -> gzip -> file. Never buffer the (potentially multi-GB)
+        # cluster dump in memory. Run as the agent user, which owns the Odoo DBs.
+        pipeline = (f'set -o pipefail; {shlex.quote(pg_dumpall)} --clean --if-exists '
+                    f'--no-role-passwords | gzip -c > {shlex.quote(gz_path)}')
+        _, err, rc = _run(['bash', '-c', pipeline], timeout=7200)
+        if rc != 0 or not os.path.isfile(gz_path) or os.path.getsize(gz_path) < 100:
+            pipeline_sudo = (f'set -o pipefail; sudo -u postgres {shlex.quote(pg_dumpall)} --clean '
+                             f'--if-exists --no-role-passwords | gzip -c > {shlex.quote(gz_path)}')
+            _, serr, src = _run(['bash', '-c', pipeline_sudo], timeout=7200)
+            if src != 0 or not os.path.isfile(gz_path) or os.path.getsize(gz_path) < 100:
+                raise RuntimeError(f'pg_dumpall failed: {(err or serr or "").strip()[:400]}')
         size = os.path.getsize(gz_path)
         _, uerr, urc = _run(base + ['copyto', gz_path, remote], timeout=1800)
         if urc != 0:
@@ -2928,14 +2934,17 @@ def action_cluster_restore(params, cfg):
             _, derr, drc = _run(base + ['copyto', sql_path, gz_path], timeout=1800)
             if drc != 0:
                 raise RuntimeError(f'Cluster dump download failed: {derr.strip()[:300]}')
-            sql_path_local = os.path.join(td, 'cluster.sql')
-            with gzip.open(gz_path, 'rt') as fin, open(sql_path_local, 'w') as fout:
-                shutil.copyfileobj(fin, fout)
-            # Restore the whole cluster as the postgres superuser. No
-            # ON_ERROR_STOP: the only expected error is "cannot drop the
-            # currently open/role" for the bootstrap superuser, which is benign.
-            out, err, rc = _pg_run([psql, '-v', 'ON_ERROR_STOP=0', '-f', sql_path_local, 'postgres'], timeout=7200)
-            result['log_tail'] = _tail(err or out)
+            import shlex
+            # Stream gunzip -> psql. No ON_ERROR_STOP: benign "role already exists"
+            # / "cannot drop current role" errors must not abort the restore.
+            pipeline = (f'set -o pipefail; gunzip -c {shlex.quote(gz_path)} | '
+                        f'{shlex.quote(psql)} -v ON_ERROR_STOP=0 postgres 2>&1')
+            out, err, rc = _run(['bash', '-c', pipeline], timeout=7200)
+            if rc != 0 and 'CREATE' not in (out or ''):
+                pipeline_sudo = (f'set -o pipefail; gunzip -c {shlex.quote(gz_path)} | '
+                                 f'sudo -u postgres {shlex.quote(psql)} -v ON_ERROR_STOP=0 postgres 2>&1')
+                out, err, rc = _run(['bash', '-c', pipeline_sudo], timeout=7200)
+            result['log_tail'] = _tail(out or err)
 
         # Restore the entire filestore tree.
         fs_root = _filestore_root(cfg)
