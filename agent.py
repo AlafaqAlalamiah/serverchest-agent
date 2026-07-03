@@ -2999,7 +2999,16 @@ def action_mirror_import(params, cfg):
             tar.extractall(td)
         stage = os.path.join(td, 'env')
 
-        # 1. Addons: replace module dirs, one module at a time
+        # 1. Addons: replace module dirs, one module at a time. Modules that were
+        # installed as root need a sudo fallback; if ANY module cannot be synced
+        # the whole action fails so the caller never restores a DB snapshot that
+        # references code the standby doesn't have.
+        import getpass
+        try:
+            current_user = getpass.getuser()
+        except Exception:
+            current_user = ''
+        modules_failed = []
         addons_stage = os.path.join(stage, 'addons')
         if os.path.isdir(addons_stage):
             for name in sorted(os.listdir(addons_stage)):
@@ -3007,10 +3016,24 @@ def action_mirror_import(params, cfg):
                 if not os.path.isdir(src):
                     continue
                 dest = os.path.join(target_dir, name)
-                if os.path.isdir(dest):
-                    shutil.rmtree(dest)
-                shutil.move(src, dest)
-                report['modules_synced'].append(name)
+                try:
+                    if os.path.isdir(dest):
+                        shutil.rmtree(dest)
+                    shutil.move(src, dest)
+                    report['modules_synced'].append(name)
+                except (PermissionError, OSError):
+                    _, _, rc1 = _run(['sudo', 'rm', '-rf', dest], timeout=60)
+                    _, _, rc2 = _run(['sudo', 'mv', src, dest], timeout=60)
+                    if current_user:
+                        _run(['sudo', 'chown', '-R', f'{current_user}:{current_user}', dest], timeout=60)
+                    if rc1 == 0 and rc2 == 0 and os.path.isdir(dest):
+                        report['modules_synced'].append(name)
+                    else:
+                        modules_failed.append(name)
+        if modules_failed:
+            raise RuntimeError(
+                f'Could not sync addons (permissions): {modules_failed}. '
+                f'Fix ownership of these dirs in {target_dir} (chown to the agent user) and retry.')
 
         # 2. Python deps: install only what's missing (name==version exact match)
         req_file = os.path.join(stage, 'requirements.txt')
