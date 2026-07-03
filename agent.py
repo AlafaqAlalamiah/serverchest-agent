@@ -2843,6 +2843,206 @@ def action_upload_module(params, cfg):
         _release_module_lock()
 
 
+# ── Mirroring: environment sync (DR) ─────────────────────────────────────────
+# True DR requires code-before-data: the standby must receive the source's
+# custom addons (and their Python deps) BEFORE a DB snapshot that references
+# them is restored, or Odoo's registry fails to load on the standby.
+
+def _allowed_remotes(cfg):
+    allowed = set()
+    legacy = cfg.get('backup_remote', '')
+    if legacy:
+        allowed.add(legacy.split(':')[0])
+    dest_file = os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
+    if os.path.isfile(dest_file):
+        try:
+            with open(dest_file) as f:
+                for d in json.load(f):
+                    for key in ('db_path', 'fs_path'):
+                        v = (d.get(key) or '').strip()
+                        if ':' in v:
+                            allowed.add(v.split(':')[0])
+        except Exception:
+            pass
+    return allowed
+
+def _dir_hash(path):
+    """Content hash of a module directory (paths + bytes), stable across servers."""
+    import hashlib
+    h = hashlib.sha256()
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if d not in ('__pycache__', '.git'))
+        for fn in sorted(files):
+            if fn.endswith('.pyc'):
+                continue
+            fp = os.path.join(root, fn)
+            h.update(os.path.relpath(fp, path).encode())
+            try:
+                with open(fp, 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+            except OSError:
+                pass
+    return h.hexdigest()[:16]
+
+def _venv_pip(cfg):
+    odoo_bin = cfg.get('odoo_bin', '')  # venv python interpreter
+    if odoo_bin:
+        cand = os.path.join(os.path.dirname(odoo_bin), 'pip')
+        if os.path.isfile(cand):
+            return [cand]
+        return [odoo_bin, '-m', 'pip']
+    return ['pip3']
+
+def _pip_freeze(cfg):
+    out, _, rc = _run(_venv_pip(cfg) + ['freeze', '--disable-pip-version-check'], timeout=60)
+    return sorted(l.strip() for l in out.splitlines() if l.strip() and not l.startswith('#')) if rc == 0 else []
+
+def _conf_get(cfg, key):
+    conf_path = cfg.get('odoo_conf', '')
+    if not os.path.isfile(conf_path):
+        return ''
+    parser = configparser.ConfigParser()
+    parser.read(conf_path)
+    return parser['options'].get(key, '') if 'options' in parser else ''
+
+def action_env_snapshot(params, cfg):
+    """Environment fingerprint for mirror preflight and change detection."""
+    modules = {}
+    for d in _custom_addons_dirs(cfg):
+        for name in sorted(os.listdir(d)):
+            mdir = os.path.join(d, name)
+            if os.path.isdir(mdir) and (os.path.isfile(os.path.join(mdir, '__manifest__.py'))
+                                        or os.path.isfile(os.path.join(mdir, '__openerp__.py'))):
+                modules[name] = _dir_hash(mdir)
+    return {
+        'odoo_version':       _detect_odoo_version(cfg),
+        'modules':            modules,
+        'pip':                _pip_freeze(cfg),
+        'server_wide_modules': _conf_get(cfg, 'server_wide_modules'),
+        'wkhtmltopdf':        shutil.which('wkhtmltopdf') is not None,
+    }
+
+def action_mirror_export(params, cfg):
+    """Snapshot custom addons + pip freeze + conf subset into a tar.gz on the
+    shared destination. params: db_path (remote base for this destination)."""
+    import tarfile, tempfile
+    import datetime as _dt
+    db_path = (params.get('db_path') or '').rstrip('/')
+    if ':' not in db_path:
+        raise ValueError('db_path (rclone remote path) is required')
+    dirs = _custom_addons_dirs(cfg)
+    ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    remote = f'{db_path}/mirror/env_{ts}.tar.gz'
+    count = 0
+    with tempfile.TemporaryDirectory() as td:
+        stage = os.path.join(td, 'stage')
+        os.makedirs(os.path.join(stage, 'addons'))
+        seen = set()
+        for d in dirs:
+            for name in sorted(os.listdir(d)):
+                mdir = os.path.join(d, name)
+                if name in seen or not os.path.isdir(mdir):
+                    continue
+                if not (os.path.isfile(os.path.join(mdir, '__manifest__.py'))
+                        or os.path.isfile(os.path.join(mdir, '__openerp__.py'))):
+                    continue
+                shutil.copytree(mdir, os.path.join(stage, 'addons', name),
+                                ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.git'))
+                seen.add(name)
+                count += 1
+        with open(os.path.join(stage, 'requirements.txt'), 'w') as f:
+            f.write('\n'.join(_pip_freeze(cfg)) + '\n')
+        with open(os.path.join(stage, 'env.json'), 'w') as f:
+            json.dump({'odoo_version': _detect_odoo_version(cfg),
+                       'server_wide_modules': _conf_get(cfg, 'server_wide_modules')}, f)
+        tar_path = os.path.join(td, 'env.tar.gz')
+        with tarfile.open(tar_path, 'w:gz') as tar:
+            tar.add(stage, arcname='env')
+        rclone_conf = cfg.get('rclone_config', '')
+        base = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
+        _, err, rc = _run(base + ['copyto', tar_path, remote], timeout=600)
+        if rc != 0:
+            raise RuntimeError(f'Env snapshot upload failed: {err.strip()[:300]}')
+    return {'ok': True, 'path': remote, 'modules': count}
+
+def action_mirror_import(params, cfg):
+    """Download an env snapshot and apply it: replace custom addons, install
+    missing pip packages, sync the conf subset. params: path (rclone path)."""
+    import tarfile, tempfile
+    remote = (params.get('path') or '').strip()
+    if ':' not in remote or not remote.endswith('.tar.gz'):
+        raise ValueError('Invalid env snapshot path')
+    if remote.split(':')[0] not in _allowed_remotes(cfg):
+        raise ValueError(f'Invalid path: remote not in allowed list ({sorted(_allowed_remotes(cfg))})')
+    dirs = _custom_addons_dirs(cfg)
+    if not dirs:
+        raise RuntimeError('No custom addons directory configured on this server')
+    target_dir = dirs[0]
+
+    report = {'modules_synced': [], 'pip_installed': [], 'pip_failed': [], 'conf_updated': False}
+    with tempfile.TemporaryDirectory() as td:
+        tar_path = os.path.join(td, 'env.tar.gz')
+        rclone_conf = cfg.get('rclone_config', '')
+        base = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
+        _, err, rc = _run(base + ['copyto', remote, tar_path], timeout=600)
+        if rc != 0:
+            raise RuntimeError(f'Env snapshot download failed: {err.strip()[:300]}')
+        with tarfile.open(tar_path, 'r:gz') as tar:
+            for m in tar.getmembers():  # traversal guard
+                norm = os.path.normpath(m.name)
+                if norm.startswith('..') or os.path.isabs(norm):
+                    raise ValueError(f'Unsafe path in snapshot: {m.name}')
+            tar.extractall(td)
+        stage = os.path.join(td, 'env')
+
+        # 1. Addons: replace module dirs, one module at a time
+        addons_stage = os.path.join(stage, 'addons')
+        if os.path.isdir(addons_stage):
+            for name in sorted(os.listdir(addons_stage)):
+                src = os.path.join(addons_stage, name)
+                if not os.path.isdir(src):
+                    continue
+                dest = os.path.join(target_dir, name)
+                if os.path.isdir(dest):
+                    shutil.rmtree(dest)
+                shutil.move(src, dest)
+                report['modules_synced'].append(name)
+
+        # 2. Python deps: install only what's missing (name==version exact match)
+        req_file = os.path.join(stage, 'requirements.txt')
+        if os.path.isfile(req_file):
+            local = set(_pip_freeze(cfg))
+            with open(req_file) as f:
+                wanted = [l.strip() for l in f if l.strip() and '==' in l]
+            missing = [w for w in wanted if w not in local]
+            for pkg in missing:
+                _, perr, prc = _run(_venv_pip(cfg) + ['install', '--disable-pip-version-check', pkg], timeout=300)
+                (report['pip_installed'] if prc == 0 else report['pip_failed']).append(pkg)
+
+        # 3. Conf subset (DB-coupled keys only — never hardware-coupled ones)
+        env_file = os.path.join(stage, 'env.json')
+        if os.path.isfile(env_file):
+            with open(env_file) as f:
+                env = json.load(f)
+            swm = (env.get('server_wide_modules') or '').strip()
+            if swm and swm != _conf_get(cfg, 'server_wide_modules'):
+                conf_path = cfg.get('odoo_conf', '')
+                parser = configparser.ConfigParser()
+                parser.read(conf_path)
+                if 'options' not in parser:
+                    parser['options'] = {}
+                parser['options']['server_wide_modules'] = swm
+                with open(conf_path, 'w') as f:
+                    parser.write(f)
+                report['conf_updated'] = True
+    report['ok'] = len(report['pip_failed']) == 0
+    return report
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -2900,6 +3100,9 @@ ACTIONS = {
     'list_modules':           action_list_modules,
     'module_operation':       action_module_operation,
     'upload_module':          action_upload_module,
+    'env_snapshot':           action_env_snapshot,
+    'mirror_export':          action_mirror_export,
+    'mirror_import':          action_mirror_import,
 }
 
 
