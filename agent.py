@@ -707,6 +707,7 @@ def _run_manual_backup(db, destinations, params, cfg):
             'dump_size_human': _human_size(dump_size),
             'filestore_size': fs_size,
             'destinations': dest_results,
+            'cloud_paths': cloud_paths,
         }
     except Exception as e:
         write_log(f'Backup FAILED step: manual ({e})')
