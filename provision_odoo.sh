@@ -17,6 +17,7 @@ info() { echo -e "${CYAN}→${NC} $*"; }
 # ── Args ──────────────────────────────────────────────────────────────────────
 API_KEY=""
 ODOO_VERSION="17"
+ODOO_COMMIT=""
 INIT_DB=""
 ADMIN_PWD=""
 RELAY_URL="wss://app.serverchest.com/ws/agent"
@@ -25,6 +26,7 @@ for arg in "$@"; do
   case "$arg" in
     --key=*)       API_KEY="${arg#--key=}" ;;
     --version=*)   ODOO_VERSION="${arg#--version=}" ;;
+    --commit=*)    ODOO_COMMIT="${arg#--commit=}" ;;
     --db=*)        INIT_DB="${arg#--db=}" ;;
     --admin-pwd=*) ADMIN_PWD="${arg#--admin-pwd=}" ;;
     --relay=*)     RELAY_URL="${arg#--relay=}" ;;
@@ -82,6 +84,15 @@ mkdir -p "$ODOO_HOME"
 
 info "Cloning Odoo ${ODOO_VERSION}.0 source (shallow)..."
 git clone --depth 1 --branch "${ODOO_VERSION}.0" https://github.com/odoo/odoo "$ODOO_SRC" 2>/dev/null
+if [[ -n "$ODOO_COMMIT" ]]; then
+  # Pin to the source server's exact commit so standby code matches, not just the branch
+  if git -C "$ODOO_SRC" fetch --depth 1 origin "$ODOO_COMMIT" 2>/dev/null \
+     && git -C "$ODOO_SRC" checkout -q "$ODOO_COMMIT" 2>/dev/null; then
+    ok "Pinned to commit ${ODOO_COMMIT:0:10}"
+  else
+    warn "Could not pin commit ${ODOO_COMMIT:0:10} — using branch tip (minor drift possible)"
+  fi
+fi
 ok "Source cloned"
 
 info "Creating virtualenv and installing Python requirements (the long part)..."
