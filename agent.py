@@ -2851,9 +2851,17 @@ def action_upload_module(params, cfg):
 def _filestore_root(cfg):
     return os.path.join(cfg.get('odoo_home', ''), '.local', 'share', 'Odoo', 'filestore')
 
-def _pg_super(cmd_args, timeout):
-    """Run a postgres binary as the postgres superuser (via sudoers grant)."""
-    return _run(['sudo', '-u', 'postgres'] + cmd_args, timeout=timeout)
+def _pg_run(cmd_args, timeout, input=None):
+    """Run a postgres binary. The agent user owns the Odoo databases (peer
+    auth), so try it directly first; fall back to sudo -u postgres only if a
+    sudoers grant exists. Returns (stdout, stderr, rc)."""
+    out, err, rc = _run(cmd_args, timeout=timeout, input=input)
+    if rc != 0 and ('permission denied' in (err or '').lower() or 'must be superuser' in (err or '').lower()
+                    or 'peer authentication' in (err or '').lower()):
+        s_out, s_err, s_rc = _run(['sudo', '-u', 'postgres'] + cmd_args, timeout=timeout, input=input)
+        if 'password is required' not in (s_err or '') and 'terminal is required' not in (s_err or ''):
+            return s_out, s_err, s_rc
+    return out, err, rc
 
 def action_cluster_backup(params, cfg):
     """Copy the WHOLE PostgreSQL cluster (all databases + roles/globals) in one
@@ -2876,9 +2884,9 @@ def action_cluster_backup(params, cfg):
     with tempfile.TemporaryDirectory() as td:
         gz_path = os.path.join(td, 'cluster.sql.gz')
         # pg_dumpall of the entire cluster as the postgres superuser.
-        out, err, rc = _pg_super([pg_dumpall, '--clean', '--if-exists', '--no-role-passwords'], timeout=3600)
-        if rc != 0 and not out:
-            raise RuntimeError(f'pg_dumpall failed: {err.strip()[:400]}')
+        out, err, rc = _pg_run([pg_dumpall, '--clean', '--if-exists', '--no-role-passwords'], timeout=3600)
+        if not out or (rc != 0 and 'CREATE' not in (out or '')):
+            raise RuntimeError(f'pg_dumpall failed: {(err or "").strip()[:400]}')
         with gzip.open(gz_path, 'wt') as f:
             f.write(out)
         size = os.path.getsize(gz_path)
@@ -2926,7 +2934,7 @@ def action_cluster_restore(params, cfg):
             # Restore the whole cluster as the postgres superuser. No
             # ON_ERROR_STOP: the only expected error is "cannot drop the
             # currently open/role" for the bootstrap superuser, which is benign.
-            out, err, rc = _pg_super([psql, '-v', 'ON_ERROR_STOP=0', '-f', sql_path_local, 'postgres'], timeout=7200)
+            out, err, rc = _pg_run([psql, '-v', 'ON_ERROR_STOP=0', '-f', sql_path_local, 'postgres'], timeout=7200)
             result['log_tail'] = _tail(err or out)
 
         # Restore the entire filestore tree.
