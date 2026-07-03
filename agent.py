@@ -1570,12 +1570,15 @@ def action_restore_backup(params, cfg):
         _run(['psql', '-d', db, '-c', 'DELETE FROM ir_session_store'], timeout=10)
 
         # --- Filestore restore ---
-        # Read fs_remote from backup_destinations.json (same source as backup script)
-        fs_remote = None
+        # Explicit fs_path param wins (cross-server clone: the source's filestore
+        # remote, which the local backup_destinations.json knows nothing about).
+        # Otherwise read fs_remote from backup_destinations.json (same source as
+        # backup script).
+        fs_remote = (params.get('fs_path') or '').strip().rstrip('/') or None
         fs_restored = False
         fs_error = None
         dest_file = os.path.join(cfg.get('odoo_home', ''), 'backup_destinations.json')
-        if os.path.isfile(dest_file):
+        if not fs_remote and os.path.isfile(dest_file):
             try:
                 with open(dest_file) as f:
                     dests = json.load(f)
