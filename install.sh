@@ -194,7 +194,8 @@ WantedBy=multi-user.target
 EOF
 
 # Allow the agent user to stop/start/restart services without a password.
-# Needed for: update_agent (restart serverchest-agent), restore (stop/start app service).
+# Needed for: update_agent (restart serverchest-agent), restore (stop/start app service),
+# and whole-cluster copy for server clone/mirror (pg_dumpall/psql as the postgres superuser).
 SUDOERS_FILE="/etc/sudoers.d/99-serverchest-agent"
 cat > "$SUDOERS_FILE" << SUDOEOF
 $ODOO_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart serverchest-agent
@@ -202,6 +203,10 @@ $ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart serverchest-agent
 $ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop *
 $ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start *
 $ODOO_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart *
+$ODOO_USER ALL=(postgres) NOPASSWD: /usr/bin/pg_dumpall *
+$ODOO_USER ALL=(postgres) NOPASSWD: /usr/bin/psql *
+$ODOO_USER ALL=(postgres) NOPASSWD: /usr/lib/postgresql/*/bin/pg_dumpall *
+$ODOO_USER ALL=(postgres) NOPASSWD: /usr/lib/postgresql/*/bin/psql *
 SUDOEOF
 chmod 0440 "$SUDOERS_FILE"
 
