@@ -2618,6 +2618,97 @@ def action_list_modules(params, cfg):
     return {'db': db, 'modules': modules}
 
 
+def _acquire_module_lock():
+    import time
+    if os.path.exists(MODULE_LOCK_FILE):
+        if time.time() - os.path.getmtime(MODULE_LOCK_FILE) < MODULE_LOCK_STALE:
+            raise RuntimeError('Another module operation is already in progress')
+        os.remove(MODULE_LOCK_FILE)  # stale — previous run crashed
+    fd = os.open(MODULE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+
+def _release_module_lock():
+    try:
+        os.remove(MODULE_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+
+def _tail(text, n=40):
+    return '\n'.join((text or '').splitlines()[-n:])
+
+def _odoo_shell(cfg, db, snippet):
+    """Run a python snippet through `odoo-bin shell`. The snippet must print
+    SC_OK on success; anything else is treated as failure. Returns (ok, output)."""
+    wrapped = (
+        "try:\n"
+        + ''.join(f'    {line}\n' for line in snippet.splitlines())
+        + "    env.cr.commit()\n"
+        "    print('SC_OK')\n"
+        "except Exception as e:\n"
+        "    print('SC_ERR: %s' % e)\n"
+    )
+    cmd = ['sudo', '-u', cfg['odoo_user'], cfg['odoo_bin'], 'shell',
+           '-c', cfg['odoo_conf'], '-d', db, '--no-http']
+    out, err, rc = _run(cmd, timeout=MODULE_OP_TIMEOUT, input=wrapped)
+    combined = (out or '') + '\n' + (err or '')
+    return ('SC_OK' in combined and 'SC_ERR' not in combined), combined
+
+def action_module_operation(params, cfg):
+    import time
+    db     = (params.get('db') or '').strip()
+    module = (params.get('module') or '').strip()
+    op     = params.get('op')
+    if op not in ('install', 'uninstall', 'upgrade'):
+        raise ValueError(f'Invalid op: {op}')
+    if not re.fullmatch(r'[A-Za-z0-9_]+', module):
+        raise ValueError('Invalid module name')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+    odoo_bin = cfg.get('odoo_bin', '')
+    if not odoo_bin or not os.path.isfile(odoo_bin):
+        raise RuntimeError('odoo_bin is not configured on this agent')
+
+    svc = cfg['service_name']
+    _acquire_module_lock()
+    t0 = time.time()
+    log_tail = ''
+    try:
+        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        if op in ('install', 'upgrade'):
+            flag = '-i' if op == 'install' else '-u'
+            out, err, rc = _run(
+                ['sudo', '-u', cfg['odoo_user'], odoo_bin, '-c', cfg['odoo_conf'],
+                 '-d', db, flag, module, '--stop-after-init'],
+                timeout=MODULE_OP_TIMEOUT)
+            log_tail = _tail(err or out)
+        else:  # uninstall — no CLI flag exists
+            snippet = (
+                f"mods = env['ir.module.module'].search([('name', '=', {module!r})])\n"
+                f"assert mods, 'module {module} not found in {db}'\n"
+                f"mods.button_immediate_uninstall()"
+            )
+            ok, output = _odoo_shell(cfg, db, snippet)
+            log_tail = _tail(output)
+
+        # odoo-bin exits 0 even for unknown module names ("invalid module names,
+        # ignored") — the DB state is the source of truth.
+        state_out, state_rc = _module_psql(
+            db, f"SELECT state FROM ir_module_module WHERE name='{module}';", cfg)
+        state = state_out.strip() if state_rc == 0 else 'unknown'
+        expected = {'install': 'installed', 'upgrade': 'installed', 'uninstall': 'uninstalled'}
+        ok = state == expected[op]
+        result = {'ok': ok, 'op': op, 'module': module, 'db': db, 'state': state,
+                  'duration_s': round(time.time() - t0, 1), 'log_tail': log_tail}
+        if not ok:
+            result['error'] = (f'{op} did not reach expected state '
+                               f'(module is {state!r}, expected {expected[op]!r})')
+        return result
+    finally:
+        _run(['sudo', 'systemctl', 'start', svc], timeout=90)
+        _release_module_lock()
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -2672,6 +2763,7 @@ ACTIONS = {
     'system_backup':          action_system_backup,
     'get_addons_dirs':        action_get_addons_dirs,
     'list_modules':           action_list_modules,
+    'module_operation':       action_module_operation,
 }
 
 
