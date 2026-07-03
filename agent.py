@@ -2918,8 +2918,17 @@ def action_env_snapshot(params, cfg):
             if os.path.isdir(mdir) and (os.path.isfile(os.path.join(mdir, '__manifest__.py'))
                                         or os.path.isfile(os.path.join(mdir, '__openerp__.py'))):
                 modules[name] = _dir_hash(mdir)
+    # Exact Odoo source commit (when the install is a git checkout) — lets a
+    # standby be provisioned at the SAME code state, not just the same branch.
+    odoo_commit = ''
+    odoo_src = cfg.get('odoo_src', '')
+    if odoo_src:
+        out, _, rc = _run(['git', '-C', os.path.dirname(odoo_src), 'rev-parse', 'HEAD'], timeout=10)
+        if rc == 0:
+            odoo_commit = out.strip()
     return {
         'odoo_version':       _detect_odoo_version(cfg),
+        'odoo_commit':        odoo_commit,
         'modules':            modules,
         'pip':                _pip_freeze(cfg),
         'server_wide_modules': _conf_get(cfg, 'server_wide_modules'),
