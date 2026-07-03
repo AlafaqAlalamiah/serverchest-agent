@@ -2637,6 +2637,26 @@ def _release_module_lock():
 def _tail(text, n=40):
     return '\n'.join((text or '').splitlines()[-n:])
 
+def _odoo_argv(cfg):
+    """Build the odoo-bin invocation prefix. Config convention (see
+    _autodetect_paths): odoo_bin is the Python interpreter, odoo_src is the
+    odoo-bin script. Prepend sudo only when not already running as odoo_user
+    (the agent often runs as the odoo user, where sudo -u is not permitted)."""
+    import getpass
+    odoo_src = cfg.get('odoo_src', '')
+    if not odoo_src or not os.path.isfile(odoo_src):
+        raise RuntimeError('odoo_src (odoo-bin path) is not configured on this agent')
+    odoo_bin = cfg.get('odoo_bin', '')
+    argv = [odoo_bin, odoo_src] if odoo_bin else [odoo_src]
+    user = cfg.get('odoo_user', '')
+    try:
+        current = getpass.getuser()
+    except Exception:
+        current = ''
+    if user and current != user:
+        argv = ['sudo', '-u', user] + argv
+    return argv
+
 def _odoo_shell(cfg, db, snippet):
     """Run a python snippet through `odoo-bin shell`. The snippet must print
     SC_OK on success; anything else is treated as failure. Returns (ok, output)."""
@@ -2648,8 +2668,7 @@ def _odoo_shell(cfg, db, snippet):
         "except Exception as e:\n"
         "    print('SC_ERR: %s' % e)\n"
     )
-    cmd = ['sudo', '-u', cfg['odoo_user'], cfg['odoo_bin'], 'shell',
-           '-c', cfg['odoo_conf'], '-d', db, '--no-http']
+    cmd = _odoo_argv(cfg) + ['shell', '-c', cfg['odoo_conf'], '-d', db, '--no-http']
     out, err, rc = _run(cmd, timeout=MODULE_OP_TIMEOUT, input=wrapped)
     combined = (out or '') + '\n' + (err or '')
     return ('SC_OK' in combined and 'SC_ERR' not in combined), combined
@@ -2665,9 +2684,7 @@ def action_module_operation(params, cfg):
         raise ValueError('Invalid module name')
     if not re.fullmatch(r'[A-Za-z0-9_-]+', db):
         raise ValueError('Invalid database name')
-    odoo_bin = cfg.get('odoo_bin', '')
-    if not odoo_bin or not os.path.isfile(odoo_bin):
-        raise RuntimeError('odoo_bin is not configured on this agent')
+    odoo_argv = _odoo_argv(cfg)  # validates odoo_src before touching the service
 
     svc = cfg['service_name']
     _acquire_module_lock()
@@ -2678,7 +2695,7 @@ def action_module_operation(params, cfg):
         if op in ('install', 'upgrade'):
             flag = '-i' if op == 'install' else '-u'
             out, err, rc = _run(
-                ['sudo', '-u', cfg['odoo_user'], odoo_bin, '-c', cfg['odoo_conf'],
+                odoo_argv + ['-c', cfg['odoo_conf'],
                  '-d', db, flag, module, '--stop-after-init'],
                 timeout=MODULE_OP_TIMEOUT)
             log_tail = _tail(err or out)
@@ -2746,8 +2763,14 @@ def action_upload_module(params, cfg):
             shutil.rmtree(dest)
         shutil.move(src, dest)
 
+    # Ownership: only needed (and only permitted) when not already the odoo user.
+    import getpass
     user = cfg.get('odoo_user', '')
-    if user:
+    try:
+        current = getpass.getuser()
+    except Exception:
+        current = ''
+    if user and current != user:
         _run(['sudo', 'chown', '-R', f'{user}:{user}', dest], timeout=30)
 
     result = {'ok': True, 'module': module, 'path': dest, 'apps_list_updated': False}
@@ -2768,7 +2791,7 @@ def action_upload_module(params, cfg):
             return result
         if install_now:
             out, err, rc = _run(
-                ['sudo', '-u', cfg['odoo_user'], cfg['odoo_bin'], '-c', cfg['odoo_conf'],
+                _odoo_argv(cfg) + ['-c', cfg['odoo_conf'],
                  '-d', db, '-i', module, '--stop-after-init'],
                 timeout=MODULE_OP_TIMEOUT)
             state_out, state_rc = _module_psql(
