@@ -2502,6 +2502,58 @@ def action_get_dest_health(params, cfg):
     }
 
 
+# ── Module management ─────────────────────────────────────────────────────────
+
+MODULE_ZIP_MAX_SIZE          = 50  * 1024 * 1024   # compressed
+MODULE_ZIP_MAX_UNCOMPRESSED  = 200 * 1024 * 1024   # zip-bomb guard
+MODULE_OP_TIMEOUT            = 480                  # seconds per odoo-bin run
+MODULE_LOCK_FILE             = '/tmp/serverchest-module-op.lock'
+MODULE_LOCK_STALE            = 600                  # seconds
+
+def _validate_module_zip(zip_bytes, max_size=MODULE_ZIP_MAX_SIZE,
+                         max_uncompressed=MODULE_ZIP_MAX_UNCOMPRESSED):
+    """Validate an uploaded module zip. Returns the module name (the single
+    top-level directory). Raises ValueError with a specific reason otherwise."""
+    import io, zipfile
+    if len(zip_bytes) > max_size:
+        raise ValueError(f'Zip too large ({_human_size(len(zip_bytes))}, max {_human_size(max_size)})')
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        corrupt = zf.testzip()
+        if corrupt:
+            raise ValueError(f'Corrupt zip entry: {corrupt}')
+    except zipfile.BadZipFile:
+        raise ValueError('Not a valid zip archive')
+
+    infos = [i for i in zf.infolist() if not i.filename.startswith('__MACOSX/')]
+    if not infos:
+        raise ValueError('Zip is empty')
+
+    total_uncompressed = sum(i.file_size for i in infos)
+    if total_uncompressed > max_uncompressed:
+        raise ValueError(f'Zip expands too large ({_human_size(total_uncompressed)}, '
+                         f'max {_human_size(max_uncompressed)})')
+
+    roots = set()
+    for info in infos:
+        name = info.filename
+        norm = os.path.normpath(name)
+        if norm.startswith('..') or os.path.isabs(name) or os.path.isabs(norm):
+            raise ValueError(f'Unsafe path in zip: {name}')
+        roots.add(norm.split('/', 1)[0])
+
+    if len(roots) != 1:
+        raise ValueError(f'Zip must contain exactly one top-level module directory (found: {sorted(roots)})')
+    root = roots.pop()
+    if not re.fullmatch(r'[A-Za-z0-9_]+', root):
+        raise ValueError(f'Invalid module name: {root!r}')
+
+    names = {os.path.normpath(i.filename) for i in infos}
+    if f'{root}/__manifest__.py' not in names and f'{root}/__openerp__.py' not in names:
+        raise ValueError(f'No manifest found ({root}/__manifest__.py missing)')
+    return root
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
