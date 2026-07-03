@@ -1509,12 +1509,18 @@ def action_restore_backup(params, cfg):
             if _m:
                 dump_dbname = _m.group(1).strip()
                 break
-        if dump_dbname and dump_dbname != db:
+        # allow_db_rename: clone flow intentionally restores a dump under a new
+        # database name — the caller has already confirmed the target.
+        allow_db_rename = bool(params.get('allow_db_rename', False))
+        if dump_dbname and dump_dbname != db and not allow_db_rename:
             raise RuntimeError(
                 f'Database mismatch: this dump belongs to "{dump_dbname}" but the configured '
                 f'database is "{db}". Restore aborted to prevent data loss.'
             )
-        log.info('[restore] Database name verified: %s', dump_dbname or '(not found in header)')
+        if dump_dbname and dump_dbname != db:
+            log.info('[restore] Restoring dump of "%s" as "%s" (clone)', dump_dbname, db)
+        else:
+            log.info('[restore] Database name verified: %s', dump_dbname or '(not found in header)')
 
         if dry_run:
             log.info('[restore] Dry run complete — skipping database changes')
