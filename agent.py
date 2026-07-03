@@ -2709,6 +2709,82 @@ def action_module_operation(params, cfg):
         _release_module_lock()
 
 
+def action_upload_module(params, cfg):
+    import base64, io, zipfile, tempfile
+    target_dir  = (params.get('target_dir') or '').strip()
+    db          = (params.get('db') or '').strip()
+    install_now = bool(params.get('install_now'))
+    overwrite   = bool(params.get('overwrite'))
+
+    try:
+        zip_bytes = base64.b64decode(params.get('zip_b64') or '', validate=True)
+    except Exception:
+        raise ValueError('Invalid base64 payload')
+
+    module = _validate_module_zip(zip_bytes)   # raises ValueError with reason
+
+    dirs = _custom_addons_dirs(cfg)
+    if target_dir not in dirs:
+        raise ValueError(f'target_dir must be one of the custom addons dirs: {dirs}')
+    if db and not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+    if install_now and not db:
+        raise ValueError('install_now requires a database')
+
+    dest = os.path.join(target_dir, module)
+    if os.path.isdir(dest) and not overwrite:
+        return {'ok': False, 'error': 'exists', 'module': module,
+                'detail': f'{module} already exists in {target_dir} — pass overwrite to replace it'}
+
+    # Extract to temp first; only touch the addons path after success.
+    with tempfile.TemporaryDirectory() as td:
+        zipfile.ZipFile(io.BytesIO(zip_bytes)).extractall(td)
+        src = os.path.join(td, module)
+        if not os.path.isdir(src):
+            raise RuntimeError('Extraction did not produce the expected module directory')
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        shutil.move(src, dest)
+
+    user = cfg.get('odoo_user', '')
+    if user:
+        _run(['sudo', 'chown', '-R', f'{user}:{user}', dest], timeout=30)
+
+    result = {'ok': True, 'module': module, 'path': dest, 'apps_list_updated': False}
+    if not db:
+        return result  # user can update the apps list from Odoo itself
+
+    # Update apps list (+ optional install) with a single stop/start cycle.
+    svc = cfg['service_name']
+    _acquire_module_lock()
+    try:
+        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        ok, output = _odoo_shell(cfg, db, "env['ir.module.module'].update_list()")
+        result['apps_list_updated'] = ok
+        if not ok:
+            result['ok'] = False
+            result['error'] = 'apps list update failed'
+            result['log_tail'] = _tail(output)
+            return result
+        if install_now:
+            out, err, rc = _run(
+                ['sudo', '-u', cfg['odoo_user'], cfg['odoo_bin'], '-c', cfg['odoo_conf'],
+                 '-d', db, '-i', module, '--stop-after-init'],
+                timeout=MODULE_OP_TIMEOUT)
+            state_out, state_rc = _module_psql(
+                db, f"SELECT state FROM ir_module_module WHERE name='{module}';", cfg)
+            state = state_out.strip() if state_rc == 0 else 'unknown'
+            result['install'] = {'ok': state == 'installed', 'state': state,
+                                 'log_tail': _tail(err or out)}
+            if state != 'installed':
+                result['ok'] = False
+                result['error'] = f'module uploaded but install failed (state: {state})'
+        return result
+    finally:
+        _run(['sudo', 'systemctl', 'start', svc], timeout=90)
+        _release_module_lock()
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -2764,6 +2840,7 @@ ACTIONS = {
     'get_addons_dirs':        action_get_addons_dirs,
     'list_modules':           action_list_modules,
     'module_operation':       action_module_operation,
+    'upload_module':          action_upload_module,
 }
 
 
@@ -2925,7 +3002,10 @@ async def agent_loop(cfg):
     while True:
         try:
             log.info('Connecting to relay at %s', url)
-            async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
+            # max_size: inbound commands can carry a base64 module zip (up to
+            # 50 MB × 4/3 + JSON envelope) — the library default of 1 MiB is too small.
+            async with websockets.connect(url, ping_interval=30, ping_timeout=10,
+                                          max_size=80 * 1024 * 1024) as ws:
                 backoff = 2  # reset on successful connect
 
                 # Auth
