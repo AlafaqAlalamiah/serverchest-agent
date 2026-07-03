@@ -2502,6 +2502,289 @@ def action_get_dest_health(params, cfg):
     }
 
 
+# ── Module management ─────────────────────────────────────────────────────────
+
+MODULE_ZIP_MAX_SIZE          = 50  * 1024 * 1024   # compressed
+MODULE_ZIP_MAX_UNCOMPRESSED  = 200 * 1024 * 1024   # zip-bomb guard
+MODULE_OP_TIMEOUT            = 480                  # seconds per odoo-bin run
+MODULE_LOCK_FILE             = '/tmp/serverchest-module-op.lock'
+MODULE_LOCK_STALE            = 600                  # seconds
+
+def _validate_module_zip(zip_bytes, max_size=MODULE_ZIP_MAX_SIZE,
+                         max_uncompressed=MODULE_ZIP_MAX_UNCOMPRESSED):
+    """Validate an uploaded module zip. Returns the module name (the single
+    top-level directory). Raises ValueError with a specific reason otherwise."""
+    import io, zipfile
+    if len(zip_bytes) > max_size:
+        raise ValueError(f'Zip too large ({_human_size(len(zip_bytes))}, max {_human_size(max_size)})')
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        corrupt = zf.testzip()
+        if corrupt:
+            raise ValueError(f'Corrupt zip entry: {corrupt}')
+    except zipfile.BadZipFile:
+        raise ValueError('Not a valid zip archive')
+
+    infos = [i for i in zf.infolist() if not i.filename.startswith('__MACOSX/')]
+    if not infos:
+        raise ValueError('Zip is empty')
+
+    total_uncompressed = sum(i.file_size for i in infos)
+    if total_uncompressed > max_uncompressed:
+        raise ValueError(f'Zip expands too large ({_human_size(total_uncompressed)}, '
+                         f'max {_human_size(max_uncompressed)})')
+
+    roots = set()
+    for info in infos:
+        name = info.filename
+        norm = os.path.normpath(name)
+        if norm.startswith('..') or os.path.isabs(name) or os.path.isabs(norm):
+            raise ValueError(f'Unsafe path in zip: {name}')
+        roots.add(norm.split('/', 1)[0])
+
+    if len(roots) != 1:
+        raise ValueError(f'Zip must contain exactly one top-level module directory (found: {sorted(roots)})')
+    root = roots.pop()
+    if not re.fullmatch(r'[A-Za-z0-9_]+', root):
+        raise ValueError(f'Invalid module name: {root!r}')
+
+    names = {os.path.normpath(i.filename) for i in infos}
+    if f'{root}/__manifest__.py' not in names and f'{root}/__openerp__.py' not in names:
+        raise ValueError(f'No manifest found ({root}/__manifest__.py missing)')
+    return root
+
+
+def _parse_custom_addons_paths(conf_text):
+    """First entry in addons_path is treated as core Odoo; the rest are custom.
+    (Same convention as action_get_odoo_info.)"""
+    m = re.search(r'^\s*addons_path\s*=\s*(.+)', conf_text, re.MULTILINE)
+    if not m:
+        return []
+    paths = [p.strip() for p in m.group(1).split(',') if p.strip()]
+    return paths[1:] if len(paths) > 1 else []
+
+def _custom_addons_dirs(cfg):
+    conf_path = cfg.get('odoo_conf', '')
+    if not os.path.isfile(conf_path):
+        return []
+    with open(conf_path) as f:
+        conf_text = f.read()
+    return [p for p in _parse_custom_addons_paths(conf_text) if os.path.isdir(p)]
+
+def action_get_addons_dirs(params, cfg):
+    return {'dirs': _custom_addons_dirs(cfg)}
+
+def _module_psql(db, sql, cfg):
+    """Run a query against an Odoo DB: sudo -u <odoo_user> psql first, plain psql fallback."""
+    base = ['sudo', '-u', cfg.get('odoo_user', ''), 'psql']
+    out, _, rc = _run(base + ['-d', db, '-A', '-F', '\t', '-t', '-c', sql], timeout=30)
+    if rc != 0:
+        out, _, rc = _run(['psql', '-d', db, '-A', '-F', '\t', '-t', '-c', sql], timeout=30)
+    return out, rc
+
+def action_list_modules(params, cfg):
+    db = (params.get('db') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+
+    out, rc = _module_psql(db,
+        "SELECT name, state, COALESCE(latest_version, ''), COALESCE(author, '') "
+        "FROM ir_module_module ORDER BY name;", cfg)
+    if rc != 0:
+        raise RuntimeError(f'Could not query modules for {db}')
+
+    # code versions from custom addons manifests on disk
+    code_versions = {}
+    for path in _custom_addons_dirs(cfg):
+        for d in os.listdir(path):
+            manifest = os.path.join(path, d, '__manifest__.py')
+            if os.path.isfile(manifest):
+                with open(manifest) as mf:
+                    mv = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", mf.read())
+                if mv:
+                    code_versions[d] = mv.group(1)
+
+    modules = []
+    for line in out.strip().splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2 and parts[0]:
+            modules.append({
+                'name':              parts[0],
+                'state':             parts[1],
+                'installed_version': parts[2] if len(parts) > 2 else '',
+                'author':            parts[3] if len(parts) > 3 else '',
+                'code_version':      code_versions.get(parts[0], ''),
+            })
+    return {'db': db, 'modules': modules}
+
+
+def _acquire_module_lock():
+    import time
+    if os.path.exists(MODULE_LOCK_FILE):
+        if time.time() - os.path.getmtime(MODULE_LOCK_FILE) < MODULE_LOCK_STALE:
+            raise RuntimeError('Another module operation is already in progress')
+        os.remove(MODULE_LOCK_FILE)  # stale — previous run crashed
+    fd = os.open(MODULE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+
+def _release_module_lock():
+    try:
+        os.remove(MODULE_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+
+def _tail(text, n=40):
+    return '\n'.join((text or '').splitlines()[-n:])
+
+def _odoo_shell(cfg, db, snippet):
+    """Run a python snippet through `odoo-bin shell`. The snippet must print
+    SC_OK on success; anything else is treated as failure. Returns (ok, output)."""
+    wrapped = (
+        "try:\n"
+        + ''.join(f'    {line}\n' for line in snippet.splitlines())
+        + "    env.cr.commit()\n"
+        "    print('SC_OK')\n"
+        "except Exception as e:\n"
+        "    print('SC_ERR: %s' % e)\n"
+    )
+    cmd = ['sudo', '-u', cfg['odoo_user'], cfg['odoo_bin'], 'shell',
+           '-c', cfg['odoo_conf'], '-d', db, '--no-http']
+    out, err, rc = _run(cmd, timeout=MODULE_OP_TIMEOUT, input=wrapped)
+    combined = (out or '') + '\n' + (err or '')
+    return ('SC_OK' in combined and 'SC_ERR' not in combined), combined
+
+def action_module_operation(params, cfg):
+    import time
+    db     = (params.get('db') or '').strip()
+    module = (params.get('module') or '').strip()
+    op     = params.get('op')
+    if op not in ('install', 'uninstall', 'upgrade'):
+        raise ValueError(f'Invalid op: {op}')
+    if not re.fullmatch(r'[A-Za-z0-9_]+', module):
+        raise ValueError('Invalid module name')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+    odoo_bin = cfg.get('odoo_bin', '')
+    if not odoo_bin or not os.path.isfile(odoo_bin):
+        raise RuntimeError('odoo_bin is not configured on this agent')
+
+    svc = cfg['service_name']
+    _acquire_module_lock()
+    t0 = time.time()
+    log_tail = ''
+    try:
+        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        if op in ('install', 'upgrade'):
+            flag = '-i' if op == 'install' else '-u'
+            out, err, rc = _run(
+                ['sudo', '-u', cfg['odoo_user'], odoo_bin, '-c', cfg['odoo_conf'],
+                 '-d', db, flag, module, '--stop-after-init'],
+                timeout=MODULE_OP_TIMEOUT)
+            log_tail = _tail(err or out)
+        else:  # uninstall — no CLI flag exists
+            snippet = (
+                f"mods = env['ir.module.module'].search([('name', '=', {module!r})])\n"
+                f"assert mods, 'module {module} not found in {db}'\n"
+                f"mods.button_immediate_uninstall()"
+            )
+            ok, output = _odoo_shell(cfg, db, snippet)
+            log_tail = _tail(output)
+
+        # odoo-bin exits 0 even for unknown module names ("invalid module names,
+        # ignored") — the DB state is the source of truth.
+        state_out, state_rc = _module_psql(
+            db, f"SELECT state FROM ir_module_module WHERE name='{module}';", cfg)
+        state = state_out.strip() if state_rc == 0 else 'unknown'
+        expected = {'install': 'installed', 'upgrade': 'installed', 'uninstall': 'uninstalled'}
+        ok = state == expected[op]
+        result = {'ok': ok, 'op': op, 'module': module, 'db': db, 'state': state,
+                  'duration_s': round(time.time() - t0, 1), 'log_tail': log_tail}
+        if not ok:
+            result['error'] = (f'{op} did not reach expected state '
+                               f'(module is {state!r}, expected {expected[op]!r})')
+        return result
+    finally:
+        _run(['sudo', 'systemctl', 'start', svc], timeout=90)
+        _release_module_lock()
+
+
+def action_upload_module(params, cfg):
+    import base64, io, zipfile, tempfile
+    target_dir  = (params.get('target_dir') or '').strip()
+    db          = (params.get('db') or '').strip()
+    install_now = bool(params.get('install_now'))
+    overwrite   = bool(params.get('overwrite'))
+
+    try:
+        zip_bytes = base64.b64decode(params.get('zip_b64') or '', validate=True)
+    except Exception:
+        raise ValueError('Invalid base64 payload')
+
+    module = _validate_module_zip(zip_bytes)   # raises ValueError with reason
+
+    dirs = _custom_addons_dirs(cfg)
+    if target_dir not in dirs:
+        raise ValueError(f'target_dir must be one of the custom addons dirs: {dirs}')
+    if db and not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+    if install_now and not db:
+        raise ValueError('install_now requires a database')
+
+    dest = os.path.join(target_dir, module)
+    if os.path.isdir(dest) and not overwrite:
+        return {'ok': False, 'error': 'exists', 'module': module,
+                'detail': f'{module} already exists in {target_dir} — pass overwrite to replace it'}
+
+    # Extract to temp first; only touch the addons path after success.
+    with tempfile.TemporaryDirectory() as td:
+        zipfile.ZipFile(io.BytesIO(zip_bytes)).extractall(td)
+        src = os.path.join(td, module)
+        if not os.path.isdir(src):
+            raise RuntimeError('Extraction did not produce the expected module directory')
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        shutil.move(src, dest)
+
+    user = cfg.get('odoo_user', '')
+    if user:
+        _run(['sudo', 'chown', '-R', f'{user}:{user}', dest], timeout=30)
+
+    result = {'ok': True, 'module': module, 'path': dest, 'apps_list_updated': False}
+    if not db:
+        return result  # user can update the apps list from Odoo itself
+
+    # Update apps list (+ optional install) with a single stop/start cycle.
+    svc = cfg['service_name']
+    _acquire_module_lock()
+    try:
+        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        ok, output = _odoo_shell(cfg, db, "env['ir.module.module'].update_list()")
+        result['apps_list_updated'] = ok
+        if not ok:
+            result['ok'] = False
+            result['error'] = 'apps list update failed'
+            result['log_tail'] = _tail(output)
+            return result
+        if install_now:
+            out, err, rc = _run(
+                ['sudo', '-u', cfg['odoo_user'], cfg['odoo_bin'], '-c', cfg['odoo_conf'],
+                 '-d', db, '-i', module, '--stop-after-init'],
+                timeout=MODULE_OP_TIMEOUT)
+            state_out, state_rc = _module_psql(
+                db, f"SELECT state FROM ir_module_module WHERE name='{module}';", cfg)
+            state = state_out.strip() if state_rc == 0 else 'unknown'
+            result['install'] = {'ok': state == 'installed', 'state': state,
+                                 'log_tail': _tail(err or out)}
+            if state != 'installed':
+                result['ok'] = False
+                result['error'] = f'module uploaded but install failed (state: {state})'
+        return result
+    finally:
+        _run(['sudo', 'systemctl', 'start', svc], timeout=90)
+        _release_module_lock()
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -2554,6 +2837,10 @@ ACTIONS = {
     'get_db_stats':           action_get_db_stats,
     'get_system_paths':       action_get_system_paths,
     'system_backup':          action_system_backup,
+    'get_addons_dirs':        action_get_addons_dirs,
+    'list_modules':           action_list_modules,
+    'module_operation':       action_module_operation,
+    'upload_module':          action_upload_module,
 }
 
 
@@ -2715,7 +3002,10 @@ async def agent_loop(cfg):
     while True:
         try:
             log.info('Connecting to relay at %s', url)
-            async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
+            # max_size: inbound commands can carry a base64 module zip (up to
+            # 50 MB × 4/3 + JSON envelope) — the library default of 1 MiB is too small.
+            async with websockets.connect(url, ping_interval=30, ping_timeout=10,
+                                          max_size=80 * 1024 * 1024) as ws:
                 backoff = 2  # reset on successful connect
 
                 # Auth
