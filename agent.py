@@ -2848,6 +2848,108 @@ def action_upload_module(params, cfg):
 # custom addons (and their Python deps) BEFORE a DB snapshot that references
 # them is restored, or Odoo's registry fails to load on the standby.
 
+def _filestore_root(cfg):
+    return os.path.join(cfg.get('odoo_home', ''), '.local', 'share', 'Odoo', 'filestore')
+
+def _pg_super(cmd_args, timeout):
+    """Run a postgres binary as the postgres superuser (via sudoers grant)."""
+    return _run(['sudo', '-u', 'postgres'] + cmd_args, timeout=timeout)
+
+def action_cluster_backup(params, cfg):
+    """Copy the WHOLE PostgreSQL cluster (all databases + roles/globals) in one
+    pg_dumpall, plus the entire Odoo filestore. This is server-level: no
+    per-database enumeration. params: db_path, fs_path (rclone remotes)."""
+    import tempfile, gzip, datetime as _dt
+    db_path = (params.get('db_path') or '').rstrip('/')
+    fs_path = (params.get('fs_path') or '').rstrip('/')
+    if ':' not in db_path:
+        raise ValueError('db_path (rclone remote path) is required')
+    pg_dumpall = shutil.which('pg_dumpall')
+    if not pg_dumpall:
+        raise RuntimeError('pg_dumpall not found on this server')
+
+    ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    remote = f'{db_path}/mirror/cluster_{ts}.sql.gz'
+    rclone_conf = cfg.get('rclone_config', '')
+    base = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
+
+    with tempfile.TemporaryDirectory() as td:
+        gz_path = os.path.join(td, 'cluster.sql.gz')
+        # pg_dumpall of the entire cluster as the postgres superuser.
+        out, err, rc = _pg_super([pg_dumpall, '--clean', '--if-exists', '--no-role-passwords'], timeout=3600)
+        if rc != 0 and not out:
+            raise RuntimeError(f'pg_dumpall failed: {err.strip()[:400]}')
+        with gzip.open(gz_path, 'wt') as f:
+            f.write(out)
+        size = os.path.getsize(gz_path)
+        _, uerr, urc = _run(base + ['copyto', gz_path, remote], timeout=1800)
+        if urc != 0:
+            raise RuntimeError(f'Cluster dump upload failed: {uerr.strip()[:300]}')
+
+    fs_synced = False
+    fs_root = _filestore_root(cfg)
+    if fs_path and ':' in fs_path and os.path.isdir(fs_root):
+        # Sync the ENTIRE filestore tree (all databases' subdirs) in one pass.
+        _, ferr, frc = _run(base + ['sync', fs_root, fs_path, '--transfers', '8'], timeout=3600)
+        fs_synced = (frc == 0)
+    return {'ok': True, 'sql_path': remote, 'fs_path': fs_path, 'dump_size': size,
+            'dump_size_human': _human_size(size), 'fs_synced': fs_synced}
+
+def action_cluster_restore(params, cfg):
+    """Restore a whole-cluster pg_dumpall onto this server and sync the entire
+    filestore. Overwrites ALL databases. params: sql_path, fs_path."""
+    import tempfile, gzip
+    sql_path = (params.get('sql_path') or '').strip()
+    fs_path = (params.get('fs_path') or '').strip().rstrip('/')
+    if ':' not in sql_path or not sql_path.endswith('.sql.gz'):
+        raise ValueError('Invalid cluster dump path')
+    if sql_path.split(':')[0] not in _allowed_remotes(cfg):
+        raise ValueError(f'Invalid path: remote not in allowed list ({sorted(_allowed_remotes(cfg))})')
+    psql = shutil.which('psql')
+    if not psql:
+        raise RuntimeError('psql not found on this server')
+    svc = cfg['service_name']
+    rclone_conf = cfg.get('rclone_config', '')
+    base = ['rclone', '--config', rclone_conf] if rclone_conf else ['rclone']
+
+    result = {'ok': False}
+    try:
+        _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
+        with tempfile.TemporaryDirectory() as td:
+            gz_path = os.path.join(td, 'cluster.sql.gz')
+            _, derr, drc = _run(base + ['copyto', sql_path, gz_path], timeout=1800)
+            if drc != 0:
+                raise RuntimeError(f'Cluster dump download failed: {derr.strip()[:300]}')
+            sql_path_local = os.path.join(td, 'cluster.sql')
+            with gzip.open(gz_path, 'rt') as fin, open(sql_path_local, 'w') as fout:
+                shutil.copyfileobj(fin, fout)
+            # Restore the whole cluster as the postgres superuser. No
+            # ON_ERROR_STOP: the only expected error is "cannot drop the
+            # currently open/role" for the bootstrap superuser, which is benign.
+            out, err, rc = _pg_super([psql, '-v', 'ON_ERROR_STOP=0', '-f', sql_path_local, 'postgres'], timeout=7200)
+            result['log_tail'] = _tail(err or out)
+
+        # Restore the entire filestore tree.
+        fs_root = _filestore_root(cfg)
+        if fs_path and ':' in fs_path:
+            os.makedirs(fs_root, exist_ok=True)
+            _run(base + ['sync', fs_path, fs_root, '--transfers', '8'], timeout=3600)
+            user = cfg.get('odoo_user', '')
+            if user:
+                _run(['sudo', 'chown', '-R', f'{user}:{user}', fs_root], timeout=120)
+
+        # Count restored databases owned by the odoo role.
+        odoo_user = cfg.get('odoo_user', '')
+        cnt_out, cnt_rc = _module_psql('postgres',
+            f"SELECT count(*) FROM pg_database d JOIN pg_roles r ON d.datdba=r.oid "
+            f"WHERE r.rolname='{odoo_user}' AND datname NOT IN ('template0','template1','postgres')", cfg)
+        result['databases'] = int(cnt_out.strip()) if cnt_rc == 0 and cnt_out.strip().isdigit() else None
+        result['ok'] = True
+        return result
+    finally:
+        _run(['sudo', 'systemctl', 'start', svc], timeout=90)
+
+
 def _allowed_remotes(cfg):
     allowed = set()
     legacy = cfg.get('backup_remote', '')
@@ -3135,6 +3237,8 @@ ACTIONS = {
     'env_snapshot':           action_env_snapshot,
     'mirror_export':          action_mirror_export,
     'mirror_import':          action_mirror_import,
+    'cluster_backup':         action_cluster_backup,
+    'cluster_restore':        action_cluster_restore,
 }
 
 
