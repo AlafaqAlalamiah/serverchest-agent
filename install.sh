@@ -215,6 +215,7 @@ $ODOO_USER ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/nginx/sites-enabled/default
 $ODOO_USER ALL=(root) NOPASSWD: /usr/sbin/nginx -t
 $ODOO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx
 $ODOO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl enable nginx
+$ODOO_USER ALL=(postgres) NOPASSWD: /usr/bin/createuser *
 SUDOEOF
 chmod 0440 "$SUDOERS_FILE"
 

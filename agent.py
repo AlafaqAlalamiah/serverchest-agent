@@ -3274,7 +3274,40 @@ def action_reconcile_serving(params, cfg):
             else:
                 report['skipped'].append(f'{pkg} missing (no apt privilege — run installer to grant)')
 
-    # 2. Reverse proxy. Only reconcile nginx (source's type); apache is report-only.
+    # 2. PostgreSQL — the most fundamental layer. Ensure it's present, and check
+    # version compatibility: a whole-cluster dump from a newer PG cannot reliably
+    # restore onto an older one.
+    def _pg_major(v):
+        try: return int(str(v or '').split('.')[0])
+        except Exception: return None
+    src_pg = (src.get('postgres') or {})
+    tgt_pg = (tgt.get('postgres') or {})
+    if src_pg.get('installed') and not tgt_pg.get('installed'):
+        if _sudo_ok(['apt-get', '--version']):
+            _run(['sudo', '-n', 'apt-get', 'install', '-y', '-qq', 'postgresql', 'postgresql-client'], timeout=1200)
+            odoo_user = cfg.get('odoo_user', '')
+            if odoo_user and shutil.which('psql'):
+                # Create the Odoo role (CREATEDB) so the agent can restore/own DBs.
+                chk, _, crc = _run(['sudo', '-u', 'postgres', 'psql', '-tAc',
+                                    f"SELECT 1 FROM pg_roles WHERE rolname='{odoo_user}'"], timeout=15)
+                if crc == 0 and chk.strip() != '1':
+                    _run(['sudo', '-u', 'postgres', 'createuser', '--createdb', odoo_user], timeout=15)
+            report['changes'].append('installed PostgreSQL + created Odoo role')
+            tgt = action_serving_snapshot({}, cfg)  # refresh after install
+            tgt_pg = (tgt.get('postgres') or {})
+            tgt_rp = tgt['reverse_proxy']
+        else:
+            report['ok'] = False
+            report['skipped'].append('PostgreSQL missing and no apt privilege — cluster restore will fail (run installer to grant, or provision the standby)')
+    sm, tm = _pg_major(src_pg.get('version')), _pg_major(tgt_pg.get('version'))
+    if sm and tm and tm < sm:
+        report['ok'] = False
+        report['pg_incompatible'] = True
+        report['skipped'].append(f'PostgreSQL version too old: source is {src_pg.get("version")}, target is {tgt_pg.get("version")} — a newer cluster dump cannot restore onto an older engine. Upgrade PostgreSQL on the target.')
+    elif sm and tm and tm > sm:
+        report['changes'].append(f'note: target PostgreSQL {tgt_pg.get("version")} is newer than source {src_pg.get("version")} (restore-compatible)')
+
+    # 3. Reverse proxy. Only reconcile nginx (source's type); apache is report-only.
     if src_rp.get('type') == 'nginx' and src_rp.get('proxies_odoo'):
         if not shutil.which('nginx'):
             if _sudo_ok(['apt-get', '--version']):
