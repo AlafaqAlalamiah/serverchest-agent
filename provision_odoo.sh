@@ -160,6 +160,55 @@ else
   warn "Odoo service is not active yet — check: journalctl -u ${ODOO_SVC} -n 50"
 fi
 
+# ── Reverse proxy (serve-ready standby) ───────────────────────────────────────
+# Install nginx + an Odoo vhost bound to THIS host's identity (server_name _),
+# so the standby serves on :80 immediately. DNS + TLS for the production domain
+# are the customer's failover step — deliberately not configured here.
+info "Setting up nginx reverse proxy for Odoo..."
+apt-get install -y -qq nginx >/dev/null 2>&1 || warn "nginx install failed — Odoo still reachable on :8069"
+if command -v nginx >/dev/null; then
+  CHAT_PORT=$((8069 + 3))
+  cat > /etc/nginx/sites-available/serverchest-odoo <<NGINX
+# Managed by ServerChest — Odoo reverse proxy (standby-ready).
+upstream sc_odoo { server 127.0.0.1:8069; }
+upstream sc_odoo_chat { server 127.0.0.1:${CHAT_PORT}; }
+
+server {
+    listen 80 default_server;
+    server_name _;
+    client_max_body_size 200m;
+    proxy_read_timeout 720s;
+    proxy_connect_timeout 720s;
+    proxy_send_timeout 720s;
+
+    location / {
+        proxy_pass http://sc_odoo;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+    }
+    location /longpolling { proxy_pass http://sc_odoo_chat; }
+    location /websocket {
+        proxy_pass http://sc_odoo_chat;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+}
+NGINX
+  ln -sf /etc/nginx/sites-available/serverchest-odoo /etc/nginx/sites-enabled/serverchest-odoo
+  rm -f /etc/nginx/sites-enabled/default
+  if nginx -t >/dev/null 2>&1; then
+    systemctl enable --now nginx >/dev/null 2>&1
+    systemctl reload nginx >/dev/null 2>&1
+    ok "nginx reverse proxy active — Odoo served on http://$(hostname -I | awk '{print $1}')/"
+  else
+    warn "nginx config test failed — Odoo still reachable on :8069"
+  fi
+fi
+
 # ── ServerChest agent ─────────────────────────────────────────────────────────
 info "Installing ServerChest agent..."
 curl -fsSL "$AGENT_INSTALL_URL" | bash -s -- --key="$API_KEY" --relay="$RELAY_URL"
