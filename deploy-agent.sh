@@ -62,6 +62,7 @@ done
 [[ "$FRESH" == 1 ]] && ok "CDN serving the new version" || warn "CDN not yet fresh after ~5m (agents will still get it once cached)"
 
 # 5. Trigger update_agent on requested servers via the relay (on timeman).
+if [[ ${#UPDATE_IDS[@]} -gt 0 ]]; then
 for id in "${UPDATE_IDS[@]}"; do
   info "Triggering update_agent on server $id…"
   ssh timeman "SECRET=\$(pm2 env 4 | awk -F': ' '/RELAY_INTERNAL_SECRET/{print \$2}'); \
@@ -71,5 +72,6 @@ for id in "${UPDATE_IDS[@]}"; do
     echo -n 'reconnected: '; curl -s -H \"x-relay-secret: \$SECRET\" http://127.0.0.1:3006/status/$id"
   echo
 done
+fi
 
 ok "Agent release complete."
