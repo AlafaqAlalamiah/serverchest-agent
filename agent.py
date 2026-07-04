@@ -3266,11 +3266,16 @@ def action_reconcile_serving(params, cfg):
     tgt_rp = tgt['reverse_proxy']
 
     # 1. Missing packages the source has (best-effort, needs apt sudo).
-    for pkg, bin_name in (('wkhtmltopdf', 'wkhtmltopdf'),):
+    # rclone is required by the env-sync and data-copy steps themselves, so it
+    # must be installed before them — reconcile_serving is called first.
+    for pkg in ('rclone', 'wkhtmltopdf'):
         if src.get('packages', {}).get(pkg) and not tgt['packages'].get(pkg):
             if _sudo_ok(['apt-get', '--version']):
                 _run(['sudo', '-n', 'apt-get', 'install', '-y', '-qq', pkg], timeout=600)
-                report['changes'].append(f'installed {pkg}')
+                if not shutil.which(pkg) and pkg == 'rclone':
+                    _run(['bash', '-c', 'curl -fsSL https://rclone.org/install.sh | sudo bash'], timeout=300)
+                report['changes'].append(f'installed {pkg}') if shutil.which(pkg) \
+                    else report['skipped'].append(f'{pkg} install failed')
             else:
                 report['skipped'].append(f'{pkg} missing (no apt privilege — run installer to grant)')
 

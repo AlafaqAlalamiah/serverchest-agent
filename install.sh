@@ -123,6 +123,20 @@ info "Installing Python dependency (websockets)..."
   || warn "Could not auto-install websockets. Run manually: $PYTHON_BIN -m pip install websockets"
 ok "websockets ready"
 
+# ── Install rclone ────────────────────────────────────────────────────────────
+# rclone is required for every backup / restore / clone / mirror operation. A
+# freshly provisioned server won't have it (existing manual installs did).
+if command -v rclone >/dev/null 2>&1; then
+  ok "rclone present ($(rclone version 2>/dev/null | head -1))"
+else
+  info "Installing rclone..."
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rclone >/dev/null 2>&1 || true
+  fi
+  command -v rclone >/dev/null 2>&1 || (curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1 || true)
+  if command -v rclone >/dev/null 2>&1; then ok "rclone installed"; else warn "Could not install rclone — backups/clone/mirror will fail until it is installed"; fi
+fi
+
 # ── Download agent ────────────────────────────────────────────────────────────
 AGENT_DIR="/opt/serverchest-agent"
 info "Creating agent directory at $AGENT_DIR..."
