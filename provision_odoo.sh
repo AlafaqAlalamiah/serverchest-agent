@@ -54,8 +54,17 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 info "Odoo ${ODOO_VERSION}.0 → ${ODOO_SRC}"
 
-[[ -d "$ODOO_SRC" ]] && err "$ODOO_SRC already exists — this server appears to have Odoo ${ODOO_VERSION} installed."
 command -v apt-get >/dev/null || err "This installer supports Debian/Ubuntu (apt) only."
+
+# Clean up an incomplete previous run so this can be retried on the same VM.
+if [[ -d "$ODOO_SRC" ]]; then
+  if systemctl is-active --quiet "$ODOO_SVC" 2>/dev/null; then
+    err "$ODOO_SRC already exists and Odoo ${ODOO_VERSION} is running — this server is already provisioned."
+  fi
+  warn "Found an incomplete previous install at ${ODOO_HOME} — cleaning it up to retry…"
+  systemctl disable --now "$ODOO_SVC" >/dev/null 2>&1 || true
+  rm -rf "$ODOO_HOME"
+fi
 
 # ── System packages ──────────────────────────────────────────────────────────
 info "Installing system packages (this can take 5-10 minutes — apt progress shown below)..."
@@ -70,15 +79,30 @@ apt-get install -y wkhtmltopdf >/dev/null 2>&1 || warn "wkhtmltopdf not installe
 npm install -g rtlcss >/dev/null 2>&1 || warn "rtlcss not installed — RTL (Arabic) assets need it"
 ok "System packages installed"
 
-# Odoo 17 targets Python 3.10/3.11. A much newer distro Python (Ubuntu 26.04
-# ships 3.13+) frequently breaks the pip build of gevent/greenlet/lxml/etc.
-PYVER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-PYMINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
-if [[ "$PYMINOR" -ge 13 ]]; then
-  warn "System Python is ${PYVER}. Odoo ${ODOO_VERSION} was built for 3.10/3.11 — its"
-  warn "Python dependencies may fail to compile. If the next step errors, use an"
-  warn "Ubuntu 24.04 or 22.04 VM instead. Continuing…"
+# ── Pick a Python that Odoo has wheels for (3.10/3.11) ────────────────────────
+# Odoo 17 pins gevent==22.10.2 (and friends) which only ship prebuilt wheels for
+# Python 3.10/3.11. On a newer default Python (Ubuntu 24.04=3.12, 26.04=3.14)
+# there is no wheel, pip builds from source, and modern Cython rejects gevent's
+# old code. So install python3.11 explicitly when the system Python is too new.
+PYBIN=python3
+SYS_MINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
+if [[ "$SYS_MINOR" -ge 12 ]]; then
+  OS_ID=$(. /etc/os-release; echo "$ID")
+  info "System Python is 3.${SYS_MINOR}; Odoo ${ODOO_VERSION} needs 3.10/3.11 — installing python3.11…"
+  if [[ "$OS_ID" == "ubuntu" ]]; then
+    apt-get install -y software-properties-common >/dev/null
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+    apt-get install -y python3.11 python3.11-venv python3.11-dev
+  fi
+  if command -v python3.11 >/dev/null; then
+    PYBIN=python3.11
+  else
+    err "Could not obtain Python 3.11 on this OS (${OS_ID}). Use Ubuntu 22.04/24.04, or Debian 12 (ships 3.11)."
+  fi
 fi
+PYVER=$($PYBIN -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+ok "Using Python ${PYVER} (${PYBIN}) for the Odoo virtualenv"
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
 systemctl enable --now postgresql >/dev/null 2>&1 || true
@@ -106,11 +130,11 @@ if [[ -n "$ODOO_COMMIT" ]]; then
 fi
 ok "Source cloned"
 
-info "Creating virtualenv and installing Python requirements (the long part — progress shown)..."
-python3 -m venv "$ODOO_VENV"
+info "Creating virtualenv (Python ${PYVER}) and installing Python requirements (the long part — progress shown)..."
+"$PYBIN" -m venv "$ODOO_VENV"
 "$ODOO_VENV/bin/pip" install --upgrade pip wheel setuptools
 if ! "$ODOO_VENV/bin/pip" install -r "$ODOO_SRC/requirements.txt"; then
-  err "Odoo Python requirements failed to install. This is usually a Python-version mismatch (system Python ${PYVER:-?} vs Odoo ${ODOO_VERSION}). Recreate the target on Ubuntu 24.04 or 22.04 and re-run."
+  err "Odoo Python requirements failed to install even on Python ${PYVER}. Check the pip output above for the failing package."
 fi
 ok "Python requirements installed"
 
