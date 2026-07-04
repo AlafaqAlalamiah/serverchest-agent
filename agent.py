@@ -3166,6 +3166,185 @@ def _conf_get(cfg, key):
     parser.read(conf_path)
     return parser['options'].get(key, '') if 'options' in parser else ''
 
+def _detect_reverse_proxy(cfg):
+    """Read-only detection of the web server in front of Odoo and the
+    Odoo-relevant tunables of its vhost. Never reads private keys — only notes
+    whether SSL is configured. Used to reconcile a standby's serving stack."""
+    import glob, re as _re
+    odoo_port = '8069'
+    conf_txt = ''
+    if os.path.isfile(cfg.get('odoo_conf', '')):
+        with open(cfg['odoo_conf']) as f:
+            conf_txt = f.read()
+    m = _re.search(r'^\s*http_port\s*=\s*(\d+)', conf_txt, _re.MULTILINE)
+    if m:
+        odoo_port = m.group(1)
+
+    info = {'type': None, 'proxies_odoo': False, 'client_max_body_size': None,
+            'proxy_read_timeout': None, 'has_longpolling': False, 'has_websocket': False,
+            'ssl': False, 'odoo_port': odoo_port, 'vhost_files': []}
+
+    if shutil.which('nginx'):
+        info['type'] = 'nginx'
+        candidates = (glob.glob('/etc/nginx/sites-enabled/*') + glob.glob('/etc/nginx/conf.d/*.conf'))
+        for path in candidates:
+            try:
+                with open(path) as f:
+                    txt = f.read()
+            except OSError:
+                continue
+            if odoo_port in txt or _re.search(r'proxy_pass\s+https?://(odoo|odoochat|127\.0\.0\.1:'+odoo_port+')', txt):
+                info['proxies_odoo'] = True
+                info['vhost_files'].append(path)
+                cmb = _re.search(r'client_max_body_size\s+([0-9]+[kKmMgG]?)', txt)
+                if cmb: info['client_max_body_size'] = cmb.group(1)
+                prt = _re.search(r'proxy_read_timeout\s+([0-9]+[a-z]?)', txt)
+                if prt: info['proxy_read_timeout'] = prt.group(1)
+                if 'longpolling' in txt: info['has_longpolling'] = True
+                if 'websocket' in txt or 'Upgrade' in txt: info['has_websocket'] = True
+                if 'ssl_certificate' in txt or 'listen 443' in txt: info['ssl'] = True
+    elif shutil.which('apache2') or shutil.which('httpd'):
+        info['type'] = 'apache'
+        for path in glob.glob('/etc/apache2/sites-enabled/*') + glob.glob('/etc/httpd/conf.d/*.conf'):
+            try:
+                with open(path) as f: txt = f.read()
+            except OSError:
+                continue
+            if odoo_port in txt or 'ProxyPass' in txt:
+                info['proxies_odoo'] = True
+                info['vhost_files'].append(path)
+                if 'SSLEngine' in txt or 'VirtualHost *:443' in txt: info['ssl'] = True
+    return info
+
+# Odoo nginx vhost template — serves on the target's OWN identity (server_name _
+# = any host/IP, reachable immediately). No SSL, no domain: DNS + cert are the
+# customer's failover step. Tunables (body size, timeout) come from the source.
+_NGINX_ODOO_TEMPLATE = """# Managed by ServerChest — Odoo reverse proxy (standby-ready).
+upstream sc_odoo {{ server 127.0.0.1:{odoo_port}; }}
+upstream sc_odoo_chat {{ server 127.0.0.1:{chat_port}; }}
+
+server {{
+    listen 80 default_server;
+    server_name _;
+    client_max_body_size {body_size};
+    proxy_read_timeout {read_timeout};
+    proxy_connect_timeout {read_timeout};
+    proxy_send_timeout {read_timeout};
+
+    location / {{
+        proxy_pass http://sc_odoo;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect off;
+    }}
+    location /longpolling {{ proxy_pass http://sc_odoo_chat; }}
+    location /websocket {{
+        proxy_pass http://sc_odoo_chat;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }}
+}}
+"""
+
+def _sudo_ok(test_cmd):
+    out, err, rc = _run(['sudo', '-n'] + test_cmd, timeout=10)
+    return rc == 0 or ('a password is required' not in (err or '') and 'terminal is required' not in (err or ''))
+
+def action_reconcile_serving(params, cfg):
+    """Converge THIS server's serving stack toward the source's snapshot:
+    install a missing reverse proxy and add/adjust an Odoo vhost templated to
+    THIS server's identity. Requires elevated sudo (installer grant). Reports a
+    diff of what changed; never touches DNS or TLS keys. params: source (snapshot)."""
+    src = params.get('source', {}) or {}
+    src_rp = src.get('reverse_proxy', {}) or {}
+    report = {'changes': [], 'skipped': [], 'ok': True}
+
+    tgt = action_serving_snapshot({}, cfg)
+    tgt_rp = tgt['reverse_proxy']
+
+    # 1. Missing packages the source has (best-effort, needs apt sudo).
+    for pkg, bin_name in (('wkhtmltopdf', 'wkhtmltopdf'),):
+        if src.get('packages', {}).get(pkg) and not tgt['packages'].get(pkg):
+            if _sudo_ok(['apt-get', '--version']):
+                _run(['sudo', '-n', 'apt-get', 'install', '-y', '-qq', pkg], timeout=600)
+                report['changes'].append(f'installed {pkg}')
+            else:
+                report['skipped'].append(f'{pkg} missing (no apt privilege — run installer to grant)')
+
+    # 2. Reverse proxy. Only reconcile nginx (source's type); apache is report-only.
+    if src_rp.get('type') == 'nginx' and src_rp.get('proxies_odoo'):
+        if not shutil.which('nginx'):
+            if _sudo_ok(['apt-get', '--version']):
+                _run(['sudo', '-n', 'apt-get', 'install', '-y', '-qq', 'nginx'], timeout=600)
+                report['changes'].append('installed nginx')
+            else:
+                report['ok'] = False
+                report['skipped'].append('nginx not installed and no apt privilege — cannot make standby serve on :80')
+                return report
+        # Write/adjust the Odoo vhost if the target has none proxying Odoo.
+        if not tgt_rp.get('proxies_odoo'):
+            odoo_port = tgt_rp.get('odoo_port', '8069')
+            chat_port = str(int(odoo_port) + 3) if odoo_port.isdigit() else '8072'
+            vhost = _NGINX_ODOO_TEMPLATE.format(
+                odoo_port=odoo_port, chat_port=chat_port,
+                body_size=src_rp.get('client_max_body_size') or '200m',
+                read_timeout=src_rp.get('proxy_read_timeout') or '720s')
+            avail = '/etc/nginx/sites-available/serverchest-odoo'
+            enabled = '/etc/nginx/sites-enabled/serverchest-odoo'
+            import tempfile
+            with tempfile.NamedTemporaryFile('w', suffix='.conf', dir='/tmp', delete=False) as tf:
+                tf.write(vhost); tmp = tf.name
+            w1 = _run(['sudo', '-n', 'cp', tmp, avail], timeout=15)
+            _run(['sudo', '-n', 'ln', '-sf', avail, enabled], timeout=15)
+            # Disable the stock default that would shadow default_server.
+            _run(['sudo', '-n', 'rm', '-f', '/etc/nginx/sites-enabled/default'], timeout=15)
+            os.unlink(tmp)
+            _, terr, trc = _run(['sudo', '-n', 'nginx', '-t'], timeout=20)
+            if trc == 0:
+                _run(['sudo', '-n', 'systemctl', 'reload', 'nginx'], timeout=30)
+                _run(['sudo', '-n', 'systemctl', 'enable', 'nginx'], timeout=15)
+                report['changes'].append('added Odoo reverse-proxy vhost (serves on :80, this host)')
+            else:
+                report['ok'] = False
+                report['skipped'].append(f'nginx config test failed: {(terr or "").strip()[:200]}')
+        else:
+            report['skipped'].append('target already proxies Odoo — left as-is')
+    elif src_rp.get('type') and not tgt_rp.get('type'):
+        report['skipped'].append(f'source uses {src_rp["type"]}; target has no web server — install {src_rp["type"]} to serve on :80')
+
+    return report
+
+
+def action_serving_snapshot(params, cfg):
+    """Structured snapshot of the serving stack for reconcile/preflight."""
+    import subprocess as _sp
+    def _pkg(name):
+        return shutil.which(name) is not None
+    pg_version = ''
+    if shutil.which('psql'):
+        try:
+            out, _, rc = _run(['psql', '--version'], timeout=10)
+            if rc == 0:
+                mm = re.search(r'(\d+\.\d+|\d+)', out)
+                pg_version = mm.group(1) if mm else ''
+        except Exception:
+            pass
+    return {
+        'reverse_proxy': _detect_reverse_proxy(cfg),
+        'postgres': {'installed': _pkg('psql'), 'version': pg_version},
+        'packages': {
+            'wkhtmltopdf': _pkg('wkhtmltopdf'),
+            'rclone': _pkg('rclone'),
+            'nginx': _pkg('nginx'),
+        },
+        'service_name': cfg.get('service_name', ''),
+        'os': _detect_os(),
+    }
+
+
 def action_env_snapshot(params, cfg):
     """Environment fingerprint for mirror preflight and change detection."""
     modules = {}
@@ -3396,6 +3575,8 @@ ACTIONS = {
     'module_operation':       action_module_operation,
     'upload_module':          action_upload_module,
     'env_snapshot':           action_env_snapshot,
+    'serving_snapshot':       action_serving_snapshot,
+    'reconcile_serving':      action_reconcile_serving,
     'mirror_export':          action_mirror_export,
     'mirror_import':          action_mirror_import,
     'cluster_backup':         action_cluster_backup,

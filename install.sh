@@ -195,7 +195,8 @@ EOF
 
 # Allow the agent user to stop/start/restart services without a password.
 # Needed for: update_agent (restart serverchest-agent), restore (stop/start app service),
-# and whole-cluster copy for server clone/mirror (pg_dumpall/psql as the postgres superuser).
+# whole-cluster copy (pg_dumpall/psql as postgres); and serving-stack reconcile
+# for clone/mirror standbys (install deps + write the Odoo nginx vhost).
 SUDOERS_FILE="/etc/sudoers.d/99-serverchest-agent"
 cat > "$SUDOERS_FILE" << SUDOEOF
 $ODOO_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart serverchest-agent
@@ -207,6 +208,13 @@ $ODOO_USER ALL=(postgres) NOPASSWD: /usr/bin/pg_dumpall *
 $ODOO_USER ALL=(postgres) NOPASSWD: /usr/bin/psql *
 $ODOO_USER ALL=(postgres) NOPASSWD: /usr/lib/postgresql/*/bin/pg_dumpall *
 $ODOO_USER ALL=(postgres) NOPASSWD: /usr/lib/postgresql/*/bin/psql *
+$ODOO_USER ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq *
+$ODOO_USER ALL=(root) NOPASSWD: /usr/bin/cp /tmp/* /etc/nginx/sites-available/serverchest-odoo
+$ODOO_USER ALL=(root) NOPASSWD: /usr/bin/ln -sf /etc/nginx/sites-available/serverchest-odoo /etc/nginx/sites-enabled/serverchest-odoo
+$ODOO_USER ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/nginx/sites-enabled/default
+$ODOO_USER ALL=(root) NOPASSWD: /usr/sbin/nginx -t
+$ODOO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx
+$ODOO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl enable nginx
 SUDOEOF
 chmod 0440 "$SUDOERS_FILE"
 
