@@ -44,7 +44,12 @@ ODOO_VENV="${ODOO_HOME}/odoo${ODOO_VERSION}-venv"
 ODOO_CONF="/etc/odoo${ODOO_VERSION}.conf"
 ODOO_SVC="odoo${ODOO_VERSION}"
 ODOO_LOG_DIR="/var/log/odoo${ODOO_VERSION}"
-[[ -z "$ADMIN_PWD" ]] && ADMIN_PWD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+if [[ -z "$ADMIN_PWD" ]]; then
+  # Read a bounded chunk first (head at the front never SIGPIPEs), then slice —
+  # a trailing "| head -c N" would SIGPIPE tr and, under pipefail+set -e, abort.
+  _rand=$(head -c 60 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')
+  ADMIN_PWD=${_rand:0:20}
+fi
 export DEBIAN_FRONTEND=noninteractive
 LOG_FILE="/var/log/serverchest-provision.log"
 : > "$LOG_FILE"
@@ -115,7 +120,9 @@ _install_py311() {
 }
 _pg_setup() {
   systemctl enable --now postgresql
-  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${ODOO_USER}'" | grep -q 1; then
+  local exists
+  exists=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${ODOO_USER}'")
+  if [[ "$exists" != "1" ]]; then
     sudo -u postgres createuser --createdb "$ODOO_USER"
   fi
 }
