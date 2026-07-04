@@ -58,16 +58,27 @@ info "Odoo ${ODOO_VERSION}.0 → ${ODOO_SRC}"
 command -v apt-get >/dev/null || err "This installer supports Debian/Ubuntu (apt) only."
 
 # ── System packages ──────────────────────────────────────────────────────────
-info "Installing system packages (this can take a few minutes)..."
+info "Installing system packages (this can take 5-10 minutes — apt progress shown below)..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git curl python3 python3-venv python3-dev python3-pip \
+apt-get update
+info "Installing build tools, Python, PostgreSQL, Node…"
+apt-get install -y git curl python3 python3-venv python3-dev python3-pip \
   build-essential libpq-dev libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev \
   libjpeg-dev zlib1g-dev libffi-dev libssl-dev pkg-config \
-  postgresql postgresql-client node-less npm >/dev/null
-apt-get install -y -qq wkhtmltopdf >/dev/null 2>&1 || warn "wkhtmltopdf not installed — PDF reports may need it later"
+  postgresql postgresql-client node-less npm
+apt-get install -y wkhtmltopdf >/dev/null 2>&1 || warn "wkhtmltopdf not installed — PDF reports may need it later"
 npm install -g rtlcss >/dev/null 2>&1 || warn "rtlcss not installed — RTL (Arabic) assets need it"
 ok "System packages installed"
+
+# Odoo 17 targets Python 3.10/3.11. A much newer distro Python (Ubuntu 26.04
+# ships 3.13+) frequently breaks the pip build of gevent/greenlet/lxml/etc.
+PYVER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+PYMINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
+if [[ "$PYMINOR" -ge 13 ]]; then
+  warn "System Python is ${PYVER}. Odoo ${ODOO_VERSION} was built for 3.10/3.11 — its"
+  warn "Python dependencies may fail to compile. If the next step errors, use an"
+  warn "Ubuntu 24.04 or 22.04 VM instead. Continuing…"
+fi
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
 systemctl enable --now postgresql >/dev/null 2>&1 || true
@@ -95,10 +106,12 @@ if [[ -n "$ODOO_COMMIT" ]]; then
 fi
 ok "Source cloned"
 
-info "Creating virtualenv and installing Python requirements (the long part)..."
+info "Creating virtualenv and installing Python requirements (the long part — progress shown)..."
 python3 -m venv "$ODOO_VENV"
-"$ODOO_VENV/bin/pip" install --quiet --upgrade pip wheel setuptools
-"$ODOO_VENV/bin/pip" install --quiet -r "$ODOO_SRC/requirements.txt"
+"$ODOO_VENV/bin/pip" install --upgrade pip wheel setuptools
+if ! "$ODOO_VENV/bin/pip" install -r "$ODOO_SRC/requirements.txt"; then
+  err "Odoo Python requirements failed to install. This is usually a Python-version mismatch (system Python ${PYVER:-?} vs Odoo ${ODOO_VERSION}). Recreate the target on Ubuntu 24.04 or 22.04 and re-run."
+fi
 ok "Python requirements installed"
 
 # Custom addons dir — first addons_path entry is core, the rest are custom
