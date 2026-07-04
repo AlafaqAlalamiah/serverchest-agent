@@ -2843,6 +2843,139 @@ def action_upload_module(params, cfg):
         _release_module_lock()
 
 
+# ── Background job system ─────────────────────────────────────────────────────
+# Long operations (whole-cluster copy, restore) must not block the agent's
+# command channel. They run as background jobs with progress and a cancel path.
+import signal as _signal
+import time as _time
+
+class JobCancelled(Exception):
+    pass
+
+class Job:
+    def __init__(self, job_id, action):
+        self.id = job_id
+        self.action = action
+        self.status = 'running'      # running | success | failed | cancelled
+        self.progress = ''           # human step text
+        self.percent = None          # optional 0-100
+        self.result = None
+        self.error = None
+        self.started_at = _time.time()
+        self.finished_at = None
+        self.cancel_event = threading.Event()
+        self.proc = None             # current subprocess (process-group leader)
+
+    def set_progress(self, text, percent=None):
+        self.progress = text
+        if percent is not None:
+            self.percent = percent
+        log.info('[job %s] %s', self.id, text)
+
+    def snapshot(self):
+        return {
+            'job_id': self.id, 'action': self.action, 'status': self.status,
+            'progress': self.progress, 'percent': self.percent,
+            'error': self.error,
+            'result': self.result if self.status in ('success',) else None,
+            'elapsed_s': round((self.finished_at or _time.time()) - self.started_at, 1),
+        }
+
+_jobs = {}
+_jobs_lock = threading.Lock()
+
+def _prune_jobs():
+    # Keep the 30 most recent; drop finished ones older than 1 hour.
+    with _jobs_lock:
+        now = _time.time()
+        for jid in [j for j, job in _jobs.items()
+                    if job.finished_at and now - job.finished_at > 3600]:
+            _jobs.pop(jid, None)
+        if len(_jobs) > 30:
+            oldest = sorted(_jobs.values(), key=lambda j: j.started_at)[:len(_jobs) - 30]
+            for j in oldest:
+                if j.finished_at:
+                    _jobs.pop(j.id, None)
+
+def _job_run(job, cmd, timeout, input=None):
+    """Run a subprocess as the process-group leader so a cancel can kill the
+    whole pipeline (bash + pg_dumpall + gzip). Honors job.cancel_event."""
+    if job is not None and job.cancel_event.is_set():
+        raise JobCancelled()
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE if input is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
+    if job is not None:
+        job.proc = proc
+    try:
+        out, err = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except Exception: pass
+        proc.communicate()
+        raise
+    finally:
+        if job is not None:
+            job.proc = None
+    if job is not None and job.cancel_event.is_set():
+        raise JobCancelled()
+    return out, err, proc.returncode
+
+def _run_j(job, cmd, timeout=30, input=None):
+    """Job-aware _run: cancellable subprocess when a job is present, plain
+    blocking _run when called directly (preserves existing behavior)."""
+    if job is None:
+        return _run(cmd, timeout=timeout, input=input)
+    return _job_run(job, cmd, timeout, input=input)
+
+def action_start_job(params, cfg):
+    """Start a background-capable action. params: action, params. → {job_id}"""
+    action = params.get('action')
+    inner = params.get('params', {}) or {}
+    fn = JOB_ACTIONS.get(action)
+    if not fn:
+        raise ValueError(f'Not a background-capable action: {action}. Allowed: {sorted(JOB_ACTIONS)}')
+    _prune_jobs()
+    job = Job(uuid.uuid4().hex, action)
+    with _jobs_lock:
+        _jobs[job.id] = job
+    def _run_job():
+        try:
+            job.result = fn(inner, cfg, job)
+            job.status = 'cancelled' if job.cancel_event.is_set() else 'success'
+        except JobCancelled:
+            job.status = 'cancelled'
+            log.info('[job %s] cancelled', job.id)
+        except Exception as e:
+            job.status = 'failed'
+            job.error = str(e)
+            log.warning('[job %s] failed: %s', job.id, e)
+        finally:
+            job.finished_at = _time.time()
+    threading.Thread(target=_run_job, daemon=True).start()
+    return {'job_id': job.id, 'action': action}
+
+def action_job_status(params, cfg):
+    job = _jobs.get(params.get('job_id'))
+    if not job:
+        return {'error': 'unknown job', 'status': 'unknown'}
+    return job.snapshot()
+
+def action_job_cancel(params, cfg):
+    job = _jobs.get(params.get('job_id'))
+    if not job:
+        raise ValueError('unknown job')
+    job.cancel_event.set()
+    p = job.proc
+    if p:
+        try:
+            os.killpg(os.getpgid(p.pid), _signal.SIGTERM)
+        except Exception:
+            pass
+    return {'ok': True, 'job_id': job.id, 'status': job.status}
+
+
 # ── Mirroring: environment sync (DR) ─────────────────────────────────────────
 # True DR requires code-before-data: the standby must receive the source's
 # custom addons (and their Python deps) BEFORE a DB snapshot that references
@@ -2863,7 +2996,7 @@ def _pg_run(cmd_args, timeout, input=None):
             return s_out, s_err, s_rc
     return out, err, rc
 
-def action_cluster_backup(params, cfg):
+def action_cluster_backup(params, cfg, job=None):
     """Copy the WHOLE PostgreSQL cluster (all databases + roles/globals) in one
     pg_dumpall, plus the entire Odoo filestore. This is server-level: no
     per-database enumeration. params: db_path, fs_path (rclone remotes)."""
@@ -2886,30 +3019,32 @@ def action_cluster_backup(params, cfg):
         gz_path = os.path.join(td, 'cluster.sql.gz')
         # Stream pg_dumpall -> gzip -> file. Never buffer the (potentially multi-GB)
         # cluster dump in memory. Run as the agent user, which owns the Odoo DBs.
+        if job: job.set_progress('Dumping the PostgreSQL cluster…', 10)
         pipeline = (f'set -o pipefail; {shlex.quote(pg_dumpall)} --clean --if-exists '
                     f'--no-role-passwords | gzip -c > {shlex.quote(gz_path)}')
-        _, err, rc = _run(['bash', '-c', pipeline], timeout=7200)
+        _, err, rc = _run_j(job, ['bash', '-c', pipeline], timeout=7200)
         if rc != 0 or not os.path.isfile(gz_path) or os.path.getsize(gz_path) < 100:
             pipeline_sudo = (f'set -o pipefail; sudo -u postgres {shlex.quote(pg_dumpall)} --clean '
                              f'--if-exists --no-role-passwords | gzip -c > {shlex.quote(gz_path)}')
-            _, serr, src = _run(['bash', '-c', pipeline_sudo], timeout=7200)
+            _, serr, src = _run_j(job, ['bash', '-c', pipeline_sudo], timeout=7200)
             if src != 0 or not os.path.isfile(gz_path) or os.path.getsize(gz_path) < 100:
                 raise RuntimeError(f'pg_dumpall failed: {(err or serr or "").strip()[:400]}')
         size = os.path.getsize(gz_path)
-        _, uerr, urc = _run(base + ['copyto', gz_path, remote], timeout=1800)
+        if job: job.set_progress(f'Uploading cluster dump ({_human_size(size)})…', 45)
+        _, uerr, urc = _run_j(job, base + ['copyto', gz_path, remote], timeout=1800)
         if urc != 0:
             raise RuntimeError(f'Cluster dump upload failed: {uerr.strip()[:300]}')
 
     fs_synced = False
     fs_root = _filestore_root(cfg)
     if fs_path and ':' in fs_path and os.path.isdir(fs_root):
-        # Sync the ENTIRE filestore tree (all databases' subdirs) in one pass.
-        _, ferr, frc = _run(base + ['sync', fs_root, fs_path, '--transfers', '8'], timeout=3600)
+        if job: job.set_progress('Syncing the filestore…', 70)
+        _, ferr, frc = _run_j(job, base + ['sync', fs_root, fs_path, '--transfers', '8'], timeout=3600)
         fs_synced = (frc == 0)
     return {'ok': True, 'sql_path': remote, 'fs_path': fs_path, 'dump_size': size,
             'dump_size_human': _human_size(size), 'fs_synced': fs_synced}
 
-def action_cluster_restore(params, cfg):
+def action_cluster_restore(params, cfg, job=None):
     """Restore a whole-cluster pg_dumpall onto this server and sync the entire
     filestore. Overwrites ALL databases. params: sql_path, fs_path."""
     import tempfile, gzip
@@ -2928,29 +3063,32 @@ def action_cluster_restore(params, cfg):
 
     result = {'ok': False}
     try:
+        if job: job.set_progress('Stopping Odoo & downloading cluster dump…', 10)
         _run(['sudo', 'systemctl', 'stop', svc], timeout=60)
         with tempfile.TemporaryDirectory() as td:
             gz_path = os.path.join(td, 'cluster.sql.gz')
-            _, derr, drc = _run(base + ['copyto', sql_path, gz_path], timeout=1800)
+            _, derr, drc = _run_j(job, base + ['copyto', sql_path, gz_path], timeout=1800)
             if drc != 0:
                 raise RuntimeError(f'Cluster dump download failed: {derr.strip()[:300]}')
             import shlex
             # Stream gunzip -> psql. No ON_ERROR_STOP: benign "role already exists"
             # / "cannot drop current role" errors must not abort the restore.
+            if job: job.set_progress('Restoring the PostgreSQL cluster…', 40)
             pipeline = (f'set -o pipefail; gunzip -c {shlex.quote(gz_path)} | '
                         f'{shlex.quote(psql)} -v ON_ERROR_STOP=0 postgres 2>&1')
-            out, err, rc = _run(['bash', '-c', pipeline], timeout=7200)
+            out, err, rc = _run_j(job, ['bash', '-c', pipeline], timeout=7200)
             if rc != 0 and 'CREATE' not in (out or ''):
                 pipeline_sudo = (f'set -o pipefail; gunzip -c {shlex.quote(gz_path)} | '
                                  f'sudo -u postgres {shlex.quote(psql)} -v ON_ERROR_STOP=0 postgres 2>&1')
-                out, err, rc = _run(['bash', '-c', pipeline_sudo], timeout=7200)
+                out, err, rc = _run_j(job, ['bash', '-c', pipeline_sudo], timeout=7200)
             result['log_tail'] = _tail(out or err)
 
         # Restore the entire filestore tree.
         fs_root = _filestore_root(cfg)
         if fs_path and ':' in fs_path:
+            if job: job.set_progress('Restoring the filestore…', 75)
             os.makedirs(fs_root, exist_ok=True)
-            _run(base + ['sync', fs_path, fs_root, '--transfers', '8'], timeout=3600)
+            _run_j(job, base + ['sync', fs_path, fs_root, '--transfers', '8'], timeout=3600)
             user = cfg.get('odoo_user', '')
             if user:
                 _run(['sudo', 'chown', '-R', f'{user}:{user}', fs_root], timeout=120)
@@ -3194,6 +3332,12 @@ def action_mirror_import(params, cfg):
     return report
 
 
+# Background-capable actions (run via start_job, poll via job_status).
+JOB_ACTIONS = {
+    'cluster_backup':  action_cluster_backup,
+    'cluster_restore': action_cluster_restore,
+}
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 ACTIONS = {
     'ping':               action_ping,
@@ -3256,6 +3400,9 @@ ACTIONS = {
     'mirror_import':          action_mirror_import,
     'cluster_backup':         action_cluster_backup,
     'cluster_restore':        action_cluster_restore,
+    'start_job':              action_start_job,
+    'job_status':             action_job_status,
+    'job_cancel':             action_job_cancel,
 }
 
 
