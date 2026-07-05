@@ -464,6 +464,16 @@ def action_get_disk_usage(params, cfg):
 def action_get_logs(params, cfg):
     log_path = cfg['odoo_log']
     if not os.path.isfile(log_path):
+        # Config's guessed path is stale/wrong for this install layout — the
+        # actual `logfile=` in odoo.conf is the source of truth. Fall back to it
+        # rather than erroring outright (this is what auto-detection is FOR).
+        conf_path = cfg.get('odoo_conf', '')
+        if os.path.isfile(conf_path):
+            with open(conf_path) as f:
+                m = re.search(r'^\s*logfile\s*=\s*(\S+)', f.read(), re.MULTILINE)
+            if m and os.path.isfile(m.group(1)):
+                log_path = m.group(1)
+    if not os.path.isfile(log_path):
         raise FileNotFoundError(f'Log file not found: {log_path}')
     n = max(1, min(int(params.get('n', 100)), 5000))
     stdout, _, _ = _run(['tail', '-n', str(n), log_path])
@@ -2929,6 +2939,55 @@ def _run_j(job, cmd, timeout=30, input=None):
         return _run(cmd, timeout=timeout, input=input)
     return _job_run(job, cmd, timeout, input=input)
 
+_RCLONE_STATS_RE = re.compile(
+    r'Transferred:\s+([0-9.]+\s*\w+)\s*/\s*([0-9.]+\s*\w+),\s*(\d+)%.*?ETA\s+(\S+)')
+
+def _run_j_rclone(job, cmd, timeout, label):
+    """Run an rclone command with `--stats` streamed line-by-line, updating
+    job.progress with live transfer stats (bytes done/total, %, ETA) instead of
+    leaving the job frozen at one static message for the whole transfer — the
+    only way an operator can tell a long multi-file sync is alive vs. hung.
+    Falls back to a plain blocking run when called with job=None."""
+    if job is None:
+        return _run(cmd, timeout=timeout)
+    full_cmd = cmd + ['--stats=5s', '--stats-one-line', '-v']
+    proc = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, start_new_session=True)
+    job.proc = proc
+    out_lines = []
+    start = _time.time()
+    try:
+        while True:
+            if job.cancel_event.is_set():
+                try:
+                    os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+                except Exception:
+                    pass
+                proc.wait(timeout=10)
+                raise JobCancelled()
+            line = proc.stdout.readline()
+            if line == '' and proc.poll() is not None:
+                break
+            if line:
+                out_lines.append(line)
+                m = _RCLONE_STATS_RE.search(line)
+                if m:
+                    pct = int(m.group(3))
+                    job.set_progress(f'{label}: {m.group(1)} / {m.group(2)} ({pct}%, ETA {m.group(4)})', percent=pct)
+            if timeout and (_time.time() - start) > timeout:
+                try:
+                    os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+                except Exception:
+                    pass
+                proc.wait(timeout=10)
+                raise subprocess.TimeoutExpired(full_cmd, timeout)
+        rc = proc.returncode
+    finally:
+        job.proc = None
+    if job.cancel_event.is_set():
+        raise JobCancelled()
+    return ''.join(out_lines), '', rc
+
 def action_start_job(params, cfg):
     """Start a background-capable action. params: action, params. → {job_id}"""
     action = params.get('action')
@@ -2974,6 +3033,15 @@ def action_job_cancel(params, cfg):
         except Exception:
             pass
     return {'ok': True, 'job_id': job.id, 'status': job.status}
+
+def action_list_jobs(params, cfg):
+    """Operational visibility: list all known jobs (running + recently
+    finished) without needing a specific job_id — e.g. to diagnose a job whose
+    id only exists in a client's browser state."""
+    _prune_jobs()
+    with _jobs_lock:
+        jobs = sorted(_jobs.values(), key=lambda j: j.started_at, reverse=True)
+        return {'jobs': [j.snapshot() for j in jobs]}
 
 
 # ── Mirroring: environment sync (DR) ─────────────────────────────────────────
@@ -3039,7 +3107,7 @@ def action_cluster_backup(params, cfg, job=None):
     fs_root = _filestore_root(cfg)
     if fs_path and ':' in fs_path and os.path.isdir(fs_root):
         if job: job.set_progress('Syncing the filestore…', 70)
-        _, ferr, frc = _run_j(job, base + ['sync', fs_root, fs_path, '--transfers', '8'], timeout=3600)
+        _, ferr, frc = _run_j_rclone(job, base + ['sync', fs_root, fs_path, '--transfers', '8'], 3600, 'Filestore upload')
         fs_synced = (frc == 0)
     return {'ok': True, 'sql_path': remote, 'fs_path': fs_path, 'dump_size': size,
             'dump_size_human': _human_size(size), 'fs_synced': fs_synced}
@@ -3088,7 +3156,7 @@ def action_cluster_restore(params, cfg, job=None):
         if fs_path and ':' in fs_path:
             if job: job.set_progress('Restoring the filestore…', 75)
             os.makedirs(fs_root, exist_ok=True)
-            _run_j(job, base + ['sync', fs_path, fs_root, '--transfers', '8'], timeout=3600)
+            _run_j_rclone(job, base + ['sync', fs_path, fs_root, '--transfers', '8'], 3600, 'Filestore download')
             user = cfg.get('odoo_user', '')
             if user:
                 _run(['sudo', 'chown', '-R', f'{user}:{user}', fs_root], timeout=120)
@@ -3622,6 +3690,7 @@ ACTIONS = {
     'start_job':              action_start_job,
     'job_status':             action_job_status,
     'job_cancel':             action_job_cancel,
+    'list_jobs':              action_list_jobs,
 }
 
 
