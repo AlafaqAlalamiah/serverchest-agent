@@ -64,7 +64,7 @@ done
 # 5. Trigger update_agent on requested servers via the relay (on timeman).
 if [[ ${#UPDATE_IDS[@]} -gt 0 ]]; then
 for id in "${UPDATE_IDS[@]}"; do
-  info "Triggering update_agent on server $id…"
+  info "Triggering update_agent on server $id ..."
   ssh timeman "SECRET=\$(pm2 env 4 | awk -F': ' '/RELAY_INTERNAL_SECRET/{print \$2}'); \
     curl -s -X POST -H \"x-relay-secret: \$SECRET\" -H 'Content-Type: application/json' \
       -d '{\"action\":\"update_agent\",\"params\":{},\"timeout\":60000}' http://127.0.0.1:3006/send/$id | head -c 60; \
