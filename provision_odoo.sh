@@ -128,7 +128,11 @@ _pg_setup() {
 }
 _venv_deps() {
   "$PYBIN" -m venv "$ODOO_VENV"
-  "$ODOO_VENV/bin/pip" install --upgrade pip wheel setuptools
+  # Pin setuptools: Odoo's own code does `import pkg_resources` directly, which
+  # newer setuptools releases dropped entirely (moved to importlib.metadata).
+  # An unpinned install grabs the latest setuptools and Odoo crashes on its very
+  # first import — before logging even initializes, so it looks like a silent hang.
+  "$ODOO_VENV/bin/pip" install --upgrade pip wheel "setuptools<81"
   "$ODOO_VENV/bin/pip" install -r "$ODOO_SRC/requirements.txt"
 }
 _agent_install() {
@@ -195,6 +199,9 @@ ok "Database engine ready"
 # ── [5/9] Odoo source ─────────────────────────────────────────────────────────
 phase "Fetching Odoo source"
 id "$ODOO_USER" >/dev/null 2>&1 || useradd --system --create-home --home-dir "$ODOO_HOME" --shell /bin/bash "$ODOO_USER"
+# So the agent (running as this user) can actually read `journalctl -u <service>`
+# for diagnostics — without this, journalctl silently returns nothing (no error).
+usermod -aG systemd-journal "$ODOO_USER" 2>/dev/null || true
 mkdir -p "$ODOO_HOME"
 run "Cloning Odoo ${ODOO_VERSION}.0${ODOO_COMMIT:+ @ ${ODOO_COMMIT:0:10}}" _clone_odoo
 mkdir -p "$ODOO_SRC/addons/custom"   # first path = core, rest = custom (agent convention)
