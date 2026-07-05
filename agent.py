@@ -678,7 +678,7 @@ def _run_manual_backup(db, destinations, params, cfg):
                 log.info('[manual_backup] Syncing filestore to %s', fs_path)
                 _, err, rc = _run(
                     base_rclone + ['sync', filestore_local, fs_path,
-                                   '--transfers', '8', '--checksum'],
+                                   '--transfers', '8', '--checkers', '16', '--fast-list'],
                     timeout=1800,
                 )
                 if rc != 0:
@@ -1634,7 +1634,8 @@ def action_restore_backup(params, cfg):
             log.info('[restore] Syncing filestore from %s → %s', fs_remote, filestore_local)
             os.makedirs(filestore_local, exist_ok=True)
             _, fs_err, fs_rc = _run(
-                base_rclone + ['sync', fs_remote, filestore_local, '--transfers', '8'],
+                base_rclone + ['sync', fs_remote, filestore_local,
+                               '--transfers', '8', '--checkers', '16', '--fast-list'],
                 timeout=1800)
             if fs_rc != 0:
                 fs_error = fs_err.strip()[:300]
@@ -1893,6 +1894,26 @@ def action_list_databases(params, cfg):
     if rc == 0:
         return {'databases': [ln.strip() for ln in out.splitlines() if ln.strip()]}
     raise RuntimeError(f'list_databases: could not query pg_database as {odoo_user}')
+
+def action_drop_database(params, cfg):
+    """Permanently delete a database. Narrow and explicit on purpose: requires
+    a strict name match, an explicit confirm flag, and never touches template/
+    system databases. params: db, confirm (must be True)."""
+    db = (params.get('db') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', db):
+        raise ValueError('Invalid database name')
+    if db in ('postgres', 'template0', 'template1'):
+        raise ValueError(f'Refusing to drop system database {db!r}')
+    if params.get('confirm') is not True:
+        raise ValueError('confirm=true is required to drop a database')
+
+    _run(['psql', '-d', 'postgres', '-c',
+          f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+          f"WHERE datname='{db}' AND pid <> pg_backend_pid();"], timeout=15)
+    out, err, rc = _run(['psql', '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{db}"'], timeout=30)
+    if rc != 0:
+        raise RuntimeError(f'DROP DATABASE failed: {err.strip()[:300]}')
+    return {'ok': True, 'dropped': db}
 
 
 # ── SSH key management ────────────────────────────────────────────────────────
@@ -3107,7 +3128,9 @@ def action_cluster_backup(params, cfg, job=None):
     fs_root = _filestore_root(cfg)
     if fs_path and ':' in fs_path and os.path.isdir(fs_root):
         if job: job.set_progress('Syncing the filestore…', 70)
-        _, ferr, frc = _run_j_rclone(job, base + ['sync', fs_root, fs_path, '--transfers', '8'], 3600, 'Filestore upload')
+        _, ferr, frc = _run_j_rclone(job, base + ['sync', fs_root, fs_path,
+                                                   '--transfers', '8', '--checkers', '16', '--fast-list'],
+                                      3600, 'Filestore upload')
         fs_synced = (frc == 0)
     return {'ok': True, 'sql_path': remote, 'fs_path': fs_path, 'dump_size': size,
             'dump_size_human': _human_size(size), 'fs_synced': fs_synced}
@@ -3156,7 +3179,9 @@ def action_cluster_restore(params, cfg, job=None):
         if fs_path and ':' in fs_path:
             if job: job.set_progress('Restoring the filestore…', 75)
             os.makedirs(fs_root, exist_ok=True)
-            _run_j_rclone(job, base + ['sync', fs_path, fs_root, '--transfers', '8'], 3600, 'Filestore download')
+            _run_j_rclone(job, base + ['sync', fs_path, fs_root,
+                                       '--transfers', '8', '--checkers', '16', '--fast-list'],
+                          3600, 'Filestore download')
             user = cfg.get('odoo_user', '')
             if user:
                 _run(['sudo', 'chown', '-R', f'{user}:{user}', fs_root], timeout=120)
@@ -3659,6 +3684,7 @@ ACTIONS = {
     'get_rclone_remote_config':  action_get_rclone_remote_config,
     'set_rclone_remote_config':  action_set_rclone_remote_config,
     'list_databases':         action_list_databases,
+    'drop_database':          action_drop_database,
     'list_ssh_keys':          action_list_ssh_keys,
     'add_ssh_key':            action_add_ssh_key,
     'remove_ssh_key':         action_remove_ssh_key,
