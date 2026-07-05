@@ -272,7 +272,8 @@ upload_to_dest() {
     SYNC_START_LINE=$(( $(wc -l < "$RCLONE_LOG") + 1 ))
     rclone --config "$RCLONE_CONFIG" sync "$FILESTORE" "$fs_path" \
         --transfers 8 \
-        --checksum \
+        --checkers 16 \
+        --fast-list \
         --log-level INFO \
         --log-file "$RCLONE_LOG" \
         || { log "[WARN] Filestore sync failed for $dest_name"; fs_ok="fail"; }
