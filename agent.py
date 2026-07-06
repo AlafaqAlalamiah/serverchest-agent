@@ -572,15 +572,15 @@ def action_rotate_log(params, cfg):
     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     archive_path = f'{log_path}.{ts}'
 
-    _, err, rc = _run(['cp', '-p', log_path, archive_path])
+    _, err, rc = _run(['cp', '-p', log_path, archive_path], timeout=150)
     if rc != 0:
-        _, err, rc = _run(['sudo', 'cp', '-p', log_path, archive_path])
+        _, err, rc = _run(['sudo', 'cp', '-p', log_path, archive_path], timeout=150)
         if rc != 0:
             raise RuntimeError(f'Could not copy log for rotation: {err.strip()[:300]}')
 
-    _, terr, trc = _run(['truncate', '-s', '0', log_path])
+    _, terr, trc = _run(['truncate', '-s', '0', log_path], timeout=30)
     if trc != 0:
-        _, terr, trc = _run(['sudo', 'truncate', '-s', '0', log_path])
+        _, terr, trc = _run(['sudo', 'truncate', '-s', '0', log_path], timeout=30)
         if trc != 0:
             raise RuntimeError(f'Copied to {archive_path} but could not truncate the live log: {terr.strip()[:300]}')
 
