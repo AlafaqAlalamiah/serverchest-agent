@@ -461,23 +461,131 @@ def action_get_disk_usage(params, cfg):
             }
     return result
 
-def action_get_logs(params, cfg):
+def _resolve_odoo_log_path(cfg):
+    """Config's guessed path is sometimes stale/wrong for this install layout —
+    the actual `logfile=` in odoo.conf is the source of truth. Falls back to it
+    rather than erroring outright (this is what auto-detection is FOR)."""
     log_path = cfg['odoo_log']
     if not os.path.isfile(log_path):
-        # Config's guessed path is stale/wrong for this install layout — the
-        # actual `logfile=` in odoo.conf is the source of truth. Fall back to it
-        # rather than erroring outright (this is what auto-detection is FOR).
         conf_path = cfg.get('odoo_conf', '')
         if os.path.isfile(conf_path):
             with open(conf_path) as f:
                 m = re.search(r'^\s*logfile\s*=\s*(\S+)', f.read(), re.MULTILINE)
             if m and os.path.isfile(m.group(1)):
                 log_path = m.group(1)
+    return log_path
+
+def action_get_logs(params, cfg):
+    log_path = _resolve_odoo_log_path(cfg)
     if not os.path.isfile(log_path):
         raise FileNotFoundError(f'Log file not found: {log_path}')
     n = max(1, min(int(params.get('n', 100)), 5000))
     stdout, _, _ = _run(['tail', '-n', str(n), log_path])
     return {'lines': stdout.splitlines(), 'path': log_path}
+
+def _rotated_log_files(log_path):
+    """Find rotated/archived copies of a log next to the live file — matches
+    logrotate's default naming (odoo.log.1, odoo.log.2.gz, ...) and our own
+    action_rotate_log's timestamped copies. Sorted newest first."""
+    import glob
+    found = []
+    for p in glob.glob(f'{log_path}.*'):
+        if os.path.isfile(p):
+            try:
+                st = os.stat(p)
+                found.append({'path': p, 'name': os.path.basename(p),
+                               'size_bytes': st.st_size, 'size_human': _human_size(st.st_size),
+                               'mtime': datetime.datetime.fromtimestamp(st.st_mtime).isoformat()})
+            except OSError:
+                continue
+    found.sort(key=lambda f: f['mtime'], reverse=True)
+    return found
+
+def action_get_log_status(params, cfg):
+    """Read-only visibility into log size/growth and rotation — the piece
+    missing before: no way to tell if Odoo's log is quietly filling the disk,
+    or whether anything is rotating it at all."""
+    log_path = _resolve_odoo_log_path(cfg)
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(f'Log file not found: {log_path}')
+    st = os.stat(log_path)
+
+    logrotate_configured = False
+    logrotate_dir = '/etc/logrotate.d'
+    if os.path.isdir(logrotate_dir):
+        for fn in os.listdir(logrotate_dir):
+            try:
+                with open(os.path.join(logrotate_dir, fn)) as f:
+                    if log_path in f.read():
+                        logrotate_configured = True
+                        break
+            except OSError:
+                continue
+
+    return {
+        'path': log_path,
+        'size_bytes': st.st_size,
+        'size_human': _human_size(st.st_size),
+        'mtime': datetime.datetime.fromtimestamp(st.st_mtime).isoformat(),
+        'logrotate_configured': logrotate_configured,
+        'rotated': _rotated_log_files(log_path),
+    }
+
+def action_search_logs(params, cfg):
+    """Grep across the live log AND any rotated/archived copies — the tail
+    view only ever sees the current file, so anything logrotate already
+    archived (or that scrolled past the tail window) was previously
+    unreachable from the dashboard."""
+    pattern = (params.get('pattern') or '').strip()
+    if not pattern:
+        raise ValueError('pattern is required')
+    log_path = _resolve_odoo_log_path(cfg)
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(f'Log file not found: {log_path}')
+    max_results = max(1, min(int(params.get('max_results', 200)), 2000))
+
+    files = [{'path': log_path, 'name': os.path.basename(log_path)}] + \
+            [{'path': f['path'], 'name': f['name']} for f in _rotated_log_files(log_path)]
+
+    matches = []
+    for f in files:
+        if len(matches) >= max_results:
+            break
+        grep_bin = 'zgrep' if f['path'].endswith('.gz') else 'grep'
+        remaining = max_results - len(matches)
+        stdout, _, rc = _run([grep_bin, '-n', '-i', '--', pattern, f['path']], timeout=30)
+        if rc not in (0, 1):  # 1 = no matches, not an error
+            continue
+        for line in stdout.splitlines()[:remaining]:
+            lineno, _, text = line.partition(':')
+            matches.append({'file': f['name'], 'line': int(lineno) if lineno.isdigit() else None, 'text': text})
+    return {'pattern': pattern, 'matches': matches, 'truncated': len(matches) >= max_results,
+            'searched_files': [f['name'] for f in files]}
+
+def action_rotate_log(params, cfg):
+    """Manually rotate the live log now: copy-truncate, the same safe pattern
+    logrotate's `copytruncate` uses — Odoo keeps writing to the same inode, so
+    it never needs restarting or loses its open file handle."""
+    log_path = _resolve_odoo_log_path(cfg)
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(f'Log file not found: {log_path}')
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    archive_path = f'{log_path}.{ts}'
+
+    _, err, rc = _run(['cp', '-p', log_path, archive_path])
+    if rc != 0:
+        _, err, rc = _run(['sudo', 'cp', '-p', log_path, archive_path])
+        if rc != 0:
+            raise RuntimeError(f'Could not copy log for rotation: {err.strip()[:300]}')
+
+    _, terr, trc = _run(['truncate', '-s', '0', log_path])
+    if trc != 0:
+        _, terr, trc = _run(['sudo', 'truncate', '-s', '0', log_path])
+        if trc != 0:
+            raise RuntimeError(f'Copied to {archive_path} but could not truncate the live log: {terr.strip()[:300]}')
+
+    size = os.path.getsize(archive_path)
+    return {'ok': True, 'archived_as': os.path.basename(archive_path), 'archived_size_human': _human_size(size)}
 
 def action_get_rclone_log(params, cfg):
     log_path = cfg['backup_log']
@@ -3653,6 +3761,9 @@ ACTIONS = {
     'ping':               action_ping,
     'get_disk_usage':     action_get_disk_usage,
     'get_logs':           action_get_logs,
+    'get_log_status':     action_get_log_status,
+    'search_logs':        action_search_logs,
+    'rotate_log':         action_rotate_log,
     'get_rclone_log':     action_get_rclone_log,
     'get_rclone_remotes': action_get_rclone_remotes,
     'trigger_backup':         action_trigger_backup,
