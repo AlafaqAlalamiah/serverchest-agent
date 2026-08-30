@@ -3,7 +3,7 @@ set -eE
 export TZ='Asia/Riyadh'   # force consistent timestamps regardless of caller
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="20260528"
+SCRIPT_VERSION="20260831"
 DB_NAME="${DB_NAME:-YOUR_DB_NAME}"
 BACKUP_DIR="/opt/odoo17/backup/tmp"
 FILESTORE="/opt/odoo17/.local/share/Odoo/filestore/$DB_NAME"
@@ -28,6 +28,8 @@ BACKUP_TIER="daily"
 [ "$DAY_OF_MONTH" -eq 01 ] && BACKUP_TIER="monthly"
 
 declare -a DEST_UPLOAD_OK   # parallel array: "ok" or "fail" per destination
+UPLOADS_ATTEMPTED=0         # DB-dump upload attempts across all destinations/tiers
+UPLOADS_OK=0                # how many of those attempts succeeded
 
 BACKUP_START=$SECONDS
 CURRENT_STEP="init"
@@ -100,10 +102,13 @@ print(json.dumps(result))
 rclone_stats() {
     local since_line="$1"
     local stats
-    stats=$(tail -n "+${since_line}" "$RCLONE_LOG" \
+    # '-' operand + '|| true': portable stdin for BSD paste, and a failure inside
+    # this substitution must never trip the inherited ERR trap (double-reports).
+    stats=$(tail -n "+${since_line}" "$RCLONE_LOG" 2>/dev/null \
         | grep -E "^(Transferred|Checks|Deleted|Elapsed time)" \
-        | paste -sd ' | ')
+        | paste -sd ' | ' - 2>/dev/null || true)
     [ -n "$stats" ] && log "[STATS] $stats"
+    return 0    # empty stats must not fail the run (would trip the ERR trap)
 }
 
 # Upload backup metadata sidecar for cross-server restore detection
@@ -133,6 +138,7 @@ trap 'log "[ERROR] Failed at step: $CURRENT_STEP"; log "===== Backup FAILED ====
 # ─── Start ────────────────────────────────────────────────────────────────────
 touch "$RCLONE_LOG" 2>/dev/null || true
 log "===== Backup started (db: $DB_NAME) [trigger: ${TRIGGER_TYPE:-scheduled}] ====="
+command -v rclone >/dev/null 2>&1 || log "[WARN] rclone is NOT installed — every cloud upload will fail (install rclone, then re-run)"
 echo "=== rclone run: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$RCLONE_LOG"
 
 # ─── Pre-hook ─────────────────────────────────────────────────────────────────
@@ -220,9 +226,11 @@ upload_to_dest() {
 
     if [ "$use_daily" = "true" ]; then
         step_begin "Upload daily [$dest_name]"
+        UPLOADS_ATTEMPTED=$((UPLOADS_ATTEMPTED+1))
         if rclone --config "$RCLONE_CONFIG" copy "$DUMP_FILE" "$db_path/daily/" \
             --log-level NOTICE --log-file "$RCLONE_LOG"; then
             DEST_UPLOAD_OK+=("ok")
+            UPLOADS_OK=$((UPLOADS_OK+1))
             upload_metadata "$db_path/daily/${DB_NAME}_daily_${DATE}.dump" "daily"
         else
             log "[WARN] Upload failed for $dest_name (daily)"; db_ok="fail"
@@ -236,8 +244,10 @@ upload_to_dest() {
 
     if [ "$DAY_OF_WEEK" -eq 7 ] && [ "$use_weekly" = "true" ]; then
         step_begin "Upload weekly [$dest_name]"
+        UPLOADS_ATTEMPTED=$((UPLOADS_ATTEMPTED+1))
         if rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/weekly/${DB_NAME}_weekly_$DATE.dump" \
             --log-level NOTICE --log-file "$RCLONE_LOG"; then
+            UPLOADS_OK=$((UPLOADS_OK+1))
             upload_metadata "$db_path/weekly/${DB_NAME}_weekly_$DATE.dump" "weekly"
         else
             log "[WARN] Upload failed for $dest_name (weekly)"
@@ -249,8 +259,10 @@ upload_to_dest() {
 
     if [ "$DAY_OF_MONTH" -eq 01 ] && [ "$use_monthly" = "true" ]; then
         step_begin "Upload monthly [$dest_name]"
+        UPLOADS_ATTEMPTED=$((UPLOADS_ATTEMPTED+1))
         if rclone --config "$RCLONE_CONFIG" copyto "$DUMP_FILE" "$db_path/monthly/${DB_NAME}_monthly_$DATE.dump" \
             --log-level NOTICE --log-file "$RCLONE_LOG"; then
+            UPLOADS_OK=$((UPLOADS_OK+1))
             upload_metadata "$db_path/monthly/${DB_NAME}_monthly_$DATE.dump" "monthly"
         else
             log "[WARN] Upload failed for $dest_name (monthly)"
@@ -269,7 +281,7 @@ upload_to_dest() {
     step_begin "Filestore sync [$dest_name]"
     FILESTORE_SIZE=$(du -sh "$FILESTORE" 2>/dev/null | cut -f1)
     log "[INFO] Filestore size: $FILESTORE_SIZE"
-    SYNC_START_LINE=$(( $(wc -l < "$RCLONE_LOG") + 1 ))
+    SYNC_START_LINE=$(( $(wc -l < "$RCLONE_LOG" 2>/dev/null || echo 0) + 1 ))
     rclone --config "$RCLONE_CONFIG" sync "$FILESTORE" "$fs_path" \
         --transfers 8 \
         --checkers 16 \
@@ -305,6 +317,20 @@ else
         "$BACKUP_DB_REMOTE" \
         "$BACKUP_FILESTORE_REMOTE" \
         "7" "28" "365"
+fi
+
+# ─── Overall result gate ──────────────────────────────────────────────────────
+# A run only counts as successful if at least one DB upload actually worked.
+# When every upload fails (rclone missing, all remotes unreachable) the local
+# dump is KEPT as the only existing copy and the run reports FAILED — it used
+# to report success with zero copies (Berr Production incident, Aug 2026).
+if [ "$UPLOADS_ATTEMPTED" -gt 0 ] && [ "$UPLOADS_OK" -eq 0 ]; then
+    log "[ERROR] All $UPLOADS_ATTEMPTED DB upload(s) failed — keeping local dump: $DUMP_FILE"
+    ls -1t "$BACKUP_DIR"/*.dump 2>/dev/null | tail -n +3 | while read -r _old; do rm -f "$_old"; done   # cap kept local dumps at the 2 newest
+    TOTAL_SECS=$(( SECONDS - BACKUP_START ))
+    log "===== Backup FAILED (no upload succeeded) — total: $(( TOTAL_SECS / 60 ))m $(( TOTAL_SECS % 60 ))s ====="
+    report_backup failed
+    exit 1
 fi
 
 if [ "${CLEANUP_LOCAL:-true}" = "true" ]; then rm -f "$DUMP_FILE" 2>/dev/null || true; log "[INFO] Local dump deleted"; fi
