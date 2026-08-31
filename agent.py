@@ -1274,6 +1274,20 @@ def action_get_health(params, cfg):
     except Exception:
         pass
     script = cfg.get('backup_script', '')
+    # Is the backup script actually scheduled? A migrated server can have the
+    # script but no crontab entry — then backups silently never run.
+    cron_found = False
+    if script:
+        try:
+            user = cfg.get('odoo_user', '')
+            stdout, _, _ = _run(['crontab', '-u', user, '-l']) if user else _run(['crontab', '-l'])
+            for line in stdout.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#') and script in stripped:
+                    cron_found = True
+                    break
+        except Exception:
+            pass
     return {
         'rclone_installed': rclone_installed,
         'disk_total_gb': round(disk.total / 1024**3, 2),
@@ -1282,6 +1296,7 @@ def action_get_health(params, cfg):
         'disk_free_pct': round(disk.free / disk.total * 100, 1),
         'backup_script_configured': bool(script),
         'backup_script_exists': os.path.isfile(script) if script else False,
+        'backup_cron_found': cron_found,
         'db_connection': http_ok,
     }
 

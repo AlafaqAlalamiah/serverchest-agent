@@ -62,3 +62,9 @@ sudo systemctl restart serverchest-agent
 - API key is stored in `/etc/serverchest-agent.conf` (permissions: 600)
 - All communication is over WSS (WebSocket over TLS)
 - Rotate your API key at any time from the ServerChest dashboard
+
+## Server migration
+
+Moving a server to a new machine? Follow [MIGRATION.md](MIGRATION.md) — a
+filesystem rsync does **not** carry the backup stack (odoo17 crontab, rclone
+binary). Berr Production lost 12 days of backups this way in Aug 2026.
