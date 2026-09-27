@@ -2603,8 +2603,10 @@ def action_get_system_paths(params, cfg):
     }
 
 
-def action_system_backup(params, cfg):
-    """Archive the specified paths with tar+gzip and upload via rclone."""
+def action_system_backup(params, cfg, job=None):
+    """Archive the specified paths with tar+gzip and upload via rclone.
+    Runs as a background job (start_job) — a full Odoo home takes far longer
+    than the relay's command timeout; direct calls still work for old dashboards."""
     import datetime
     items       = list(params.get('items', []))
     destination = params.get('destination', '').strip()
@@ -2627,7 +2629,21 @@ def action_system_backup(params, cfg):
     try:
         # Create archive (ignore socket files which can't be archived)
         tar_cmd = ['tar', '--ignore-failed-read', '-czf', archive_path] + items
-        _, err, rc = _run(tar_cmd, timeout=3600)
+        tar_done = threading.Event()
+        if job:
+            job.set_progress('Creating archive…')
+            def _report_archive_size():
+                # tar gives no progress; the growing archive size shows it's alive
+                while not tar_done.wait(10):
+                    try:
+                        job.set_progress(f'Creating archive… {_human_size(os.path.getsize(archive_path))} so far')
+                    except OSError:
+                        pass
+            threading.Thread(target=_report_archive_size, daemon=True).start()
+        try:
+            _, err, rc = _run_j(job, tar_cmd, timeout=3600)
+        finally:
+            tar_done.set()
         if rc not in (0, 1):   # exit 1 = non-fatal warnings (socket files etc.)
             raise RuntimeError(f'Archive failed: {err.strip()}')
 
@@ -2638,9 +2654,12 @@ def action_system_backup(params, cfg):
         if rclone_cfg:
             cmd += ['--config', rclone_cfg]
         cmd += ['copy', archive_path, destination]
-        _, err, rc = _run(cmd, timeout=3600)
+        if job:
+            job.set_progress(f'Uploading archive ({_human_size(size_bytes)})…', 0)
+        # the job-aware runner merges stderr into out
+        out, err, rc = _run_j_rclone(job, cmd, timeout=3600, label='Uploading archive')
         if rc != 0:
-            raise RuntimeError(f'Upload failed: {err.strip()}')
+            raise RuntimeError(f'Upload failed: {(err or out).strip()[-500:]}')
 
         return {
             'status':      'ok',
@@ -2648,6 +2667,7 @@ def action_system_backup(params, cfg):
             'size':        _human_size(size_bytes),
             'size_bytes':  size_bytes,
             'destination': destination,
+            'path':        f'{destination.rstrip("/")}/{archive_name}',
             'items':       items,
         }
     finally:
@@ -3769,6 +3789,7 @@ def action_mirror_import(params, cfg):
 JOB_ACTIONS = {
     'cluster_backup':  action_cluster_backup,
     'cluster_restore': action_cluster_restore,
+    'system_backup':   action_system_backup,
 }
 
 # ── Dispatch table ────────────────────────────────────────────────────────────
